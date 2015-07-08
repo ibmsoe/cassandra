@@ -19,12 +19,9 @@ package org.apache.cassandra.service;
 
 import java.net.SocketAddress;
 import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -43,7 +40,7 @@ import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.thrift.ThriftValidation;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.SemanticVersion;
 
 /**
@@ -57,18 +54,11 @@ public class ClientState
     private static final Set<IResource> READABLE_SYSTEM_RESOURCES = new HashSet<>();
     private static final Set<IResource> PROTECTED_AUTH_RESOURCES = new HashSet<>();
 
-    // User-level permissions cache.
-    private static final LoadingCache<Pair<AuthenticatedUser, IResource>, Set<Permission>> permissionsCache = initPermissionsCache();
-
     static
     {
-        // We want these system cfs to be always readable since many tools rely on them (nodetool, cqlsh, bulkloader, etc.)
-        String[] cfs =  new String[] { SystemKeyspace.LOCAL_CF,
-                                       SystemKeyspace.PEERS_CF,
-                                       SystemKeyspace.SCHEMA_KEYSPACES_CF,
-                                       SystemKeyspace.SCHEMA_COLUMNFAMILIES_CF,
-                                       SystemKeyspace.SCHEMA_COLUMNS_CF };
-        for (String cf : cfs)
+        // We want these system cfs to be always readable to authenticated users since many tools rely on them
+        // (nodetool, cqlsh, bulkloader, etc.)
+        for (String cf : Iterables.concat(Arrays.asList(SystemKeyspace.LOCAL_CF, SystemKeyspace.PEERS_CF), SystemKeyspace.allSchemaCfs))
             READABLE_SYSTEM_RESOURCES.add(DataResource.columnFamily(Keyspace.SYSTEM_KS, cf));
 
         PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthenticator().protectedResources());
@@ -94,6 +84,7 @@ public class ClientState
             }
             catch (Exception e)
             {
+                JVMStabilityInspector.inspectThrowable(e);
                 logger.info("Cannot use class {} as query handler ({}), ignoring by defaulting on normal query handling", customHandlerClass, e.getMessage());
             }
         }
@@ -102,10 +93,14 @@ public class ClientState
 
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
-    private final boolean isInternal;
+    public final boolean isInternal;
 
     // The remote address of the client - null for internal clients.
     private final SocketAddress remoteAddress;
+
+    // The biggest timestamp that was returned by getTimestamp/assigned to a query. This is global to the VM
+    // for the sake of paxos (see #9649).
+    private static final AtomicLong lastTimestampMicros = new AtomicLong(0);
 
     /**
      * Construct a new, empty ClientState for internal calls.
@@ -140,6 +135,38 @@ public class ClientState
         return new ClientState(remoteAddress);
     }
 
+    /**
+     * This clock guarantees that updates for the same ClientState will be ordered
+     * in the sequence seen, even if multiple updates happen in the same millisecond.
+     */
+    public long getTimestamp()
+    {
+        while (true)
+        {
+            long current = System.currentTimeMillis() * 1000;
+            long last = lastTimestampMicros.get();
+            long tstamp = last >= current ? last + 1 : current;
+            if (lastTimestampMicros.compareAndSet(last, tstamp))
+                return tstamp;
+        }
+    }
+
+    /**
+     * This is the same than {@link #getTimestamp()} but this guarantees that the returned timestamp
+     * will not be smaller than the provided {@code minTimestampToUse}.
+     */
+    public long getTimestamp(long minTimestampToUse)
+    {
+        while (true)
+        {
+            long current = Math.max(System.currentTimeMillis() * 1000, minTimestampToUse);
+            long last = lastTimestampMicros.get();
+            long tstamp = last >= current ? last + 1 : current;
+            if (lastTimestampMicros.compareAndSet(last, tstamp))
+                return tstamp;
+        }
+    }
+
     public static QueryHandler getCQLQueryHandler()
     {
         return cqlQueryHandler;
@@ -158,7 +185,7 @@ public class ClientState
     public String getKeyspace() throws InvalidRequestException
     {
         if (keyspace == null)
-            throw new InvalidRequestException("No keyspace has been specified. USE a keyspace, or explicity specify keyspace.tablename");
+            throw new InvalidRequestException("No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename");
         return keyspace;
     }
 
@@ -321,39 +348,8 @@ public class ClientState
         return new SemanticVersion[]{ cql, cql3 };
     }
 
-    private static LoadingCache<Pair<AuthenticatedUser, IResource>, Set<Permission>> initPermissionsCache()
-    {
-        if (DatabaseDescriptor.getAuthorizer() instanceof AllowAllAuthorizer)
-            return null;
-
-        int validityPeriod = DatabaseDescriptor.getPermissionsValidity();
-        if (validityPeriod <= 0)
-            return null;
-
-        return CacheBuilder.newBuilder().expireAfterWrite(validityPeriod, TimeUnit.MILLISECONDS)
-                                        .build(new CacheLoader<Pair<AuthenticatedUser, IResource>, Set<Permission>>()
-                                        {
-                                            public Set<Permission> load(Pair<AuthenticatedUser, IResource> userResource)
-                                            {
-                                                return DatabaseDescriptor.getAuthorizer().authorize(userResource.left,
-                                                                                                    userResource.right);
-                                            }
-                                        });
-    }
-
     private Set<Permission> authorize(IResource resource)
     {
-        // AllowAllAuthorizer or manually disabled caching.
-        if (permissionsCache == null)
-            return DatabaseDescriptor.getAuthorizer().authorize(user, resource);
-
-        try
-        {
-            return permissionsCache.get(Pair.create(user, resource));
-        }
-        catch (ExecutionException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return Auth.getPermissions(user, resource);
     }
 }

@@ -118,7 +118,7 @@ public class LegacySSTableTest extends SchemaLoader
         ranges.add(new Range<>(p.getMinimumToken(), p.getToken(ByteBufferUtil.bytes("100"))));
         ranges.add(new Range<>(p.getToken(ByteBufferUtil.bytes("100")), p.getMinimumToken()));
         ArrayList<StreamSession.SSTableStreamingSections> details = new ArrayList<>();
-        details.add(new StreamSession.SSTableStreamingSections(sstable,
+        details.add(new StreamSession.SSTableStreamingSections(sstable.ref(),
                                                                sstable.getPositionsForRanges(ranges),
                                                                sstable.estimatedKeysForRanges(ranges), sstable.getSSTableMetadata().repairedAt));
         new StreamPlan("LegacyStreamingTest").transferFiles(FBUtilities.getBroadcastAddress(), details)
@@ -138,14 +138,24 @@ public class LegacySSTableTest extends SchemaLoader
             assert cf.deletionInfo().equals(DeletionInfo.live());
             assert iter.next().name().toByteBuffer().equals(key);
         }
+        sstable.selfRef().release();
     }
 
     @Test
     public void testVersions() throws Throwable
     {
+        boolean notSkipped = false;
+
         for (File version : LEGACY_SSTABLE_ROOT.listFiles())
+        {
             if (Descriptor.Version.validate(version.getName()) && new Descriptor.Version(version.getName()).isCompatible())
+            {
+                notSkipped = true;
                 testVersion(version.getName());
+            }
+        }
+
+        assert notSkipped;
     }
 
     public void testVersion(String version) throws Throwable

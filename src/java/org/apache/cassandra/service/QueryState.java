@@ -18,9 +18,9 @@
 package org.apache.cassandra.service;
 
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.transport.Frame;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -29,9 +29,7 @@ import org.apache.cassandra.utils.FBUtilities;
 public class QueryState
 {
     private final ClientState clientState;
-    private volatile long clock;
     private volatile UUID preparedTracingSession;
-    private Frame sourceFrame;
 
     public QueryState(ClientState clientState)
     {
@@ -57,19 +55,7 @@ public class QueryState
      */
     public long getTimestamp()
     {
-        long current = System.currentTimeMillis() * 1000;
-        clock = clock >= current ? clock + 1 : current;
-        return clock;
-    }
-
-    public Frame getSourceFrame()
-    {
-        return sourceFrame;
-    }
-
-    public void setSourceFrame(Frame sourceFrame)
-    {
-        this.sourceFrame = sourceFrame;
+        return clientState.getTimestamp();
     }
 
     public boolean traceNextQuery()
@@ -80,7 +66,7 @@ public class QueryState
         }
 
         double tracingProbability = StorageService.instance.getTracingProbability();
-        return tracingProbability != 0 && FBUtilities.threadLocalRandom().nextDouble() < tracingProbability;
+        return tracingProbability != 0 && ThreadLocalRandom.current().nextDouble() < tracingProbability;
     }
 
     public void prepareTracingSession(UUID sessionId)

@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
@@ -45,10 +46,15 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
     private int UPDATE_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicUpdateInterval();
     private int RESET_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicResetInterval();
     private double BADNESS_THRESHOLD = DatabaseDescriptor.getDynamicBadnessThreshold();
+
+    // the score for a merged set of endpoints must be this much worse than the score for separate endpoints to
+    // warrant not merging two ranges into a single range
+    private double RANGE_MERGING_PREFERENCE = 1.5;
+
     private String mbeanName;
     private boolean registered = false;
 
-    private final ConcurrentHashMap<InetAddress, Double> scores = new ConcurrentHashMap<InetAddress, Double>();
+    private volatile HashMap<InetAddress, Double> scores = new HashMap<InetAddress, Double>();
     private final ConcurrentHashMap<InetAddress, ExponentiallyDecayingSample> samples = new ConcurrentHashMap<InetAddress, ExponentiallyDecayingSample>();
 
     public final IEndpointSnitch subsnitch;
@@ -79,8 +85,8 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
                 reset();
             }
         };
-        StorageService.scheduledTasks.scheduleWithFixedDelay(update, UPDATE_INTERVAL_IN_MS, UPDATE_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
-        StorageService.scheduledTasks.scheduleWithFixedDelay(reset, RESET_INTERVAL_IN_MS, RESET_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(update, UPDATE_INTERVAL_IN_MS, UPDATE_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
+        ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(reset, RESET_INTERVAL_IN_MS, RESET_INTERVAL_IN_MS, TimeUnit.MILLISECONDS);
         registerMBean();
    }
 
@@ -238,6 +244,7 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         double maxLatency = 1;
         // We're going to weight the latency for each host against the worst one we see, to
         // arrive at sort of a 'badness percentage' for them. First, find the worst for each:
+        HashMap<InetAddress, Double> newScores = new HashMap<>();
         for (Map.Entry<InetAddress, ExponentiallyDecayingSample> entry : samples.entrySet())
         {
             double mean = entry.getValue().getSnapshot().getMedian();
@@ -252,8 +259,9 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
             // "Severity" is basically a measure of compaction activity (CASSANDRA-3722).
             score += StorageService.instance.getSeverity(entry.getKey());
             // lowest score (least amount of badness) wins.
-            scores.put(entry.getKey(), score);            
+            newScores.put(entry.getKey(), score);
         }
+        scores = newScores;
     }
 
 
@@ -313,6 +321,10 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         if (!subsnitch.isWorthMergingForRangeQuery(merged, l1, l2))
             return false;
 
+        // skip checking scores in the single-node case
+        if (l1.size() == 1 && l2.size() == 1 && l1.get(0).equals(l2.get(0)))
+            return true;
+
         // Make sure we return the subsnitch decision (i.e true if we're here) if we lack too much scores
         double maxMerged = maxScore(merged);
         double maxL1 = maxScore(l1);
@@ -320,7 +332,7 @@ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILa
         if (maxMerged < 0 || maxL1 < 0 || maxL2 < 0)
             return true;
 
-        return maxMerged < maxL1 + maxL2;
+        return maxMerged <= (maxL1 + maxL2) * RANGE_MERGING_PREFERENCE;
     }
 
     // Return the max score for the endpoint in the provided list, or -1.0 if no node have a score.

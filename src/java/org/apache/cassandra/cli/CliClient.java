@@ -32,22 +32,24 @@ import com.google.common.base.Predicate;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Iterables;
 
-import org.apache.cassandra.serializers.MarshalException;
 import org.apache.commons.lang3.StringUtils;
 
 import org.antlr.runtime.tree.Tree;
 import org.apache.cassandra.auth.IAuthenticator;
 import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.cql3.statements.CFPropDefs;
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
 import org.apache.cassandra.db.compaction.CompactionManagerMBean;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.SimpleSnitch;
+import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.UUIDGen;
 import org.apache.thrift.TBaseHelper;
 import org.apache.thrift.TException;
@@ -196,7 +198,7 @@ public class CliClient
     {
         sessionState.out.println("Welcome to Cassandra CLI version " + FBUtilities.getReleaseVersionString() + "\n");
 
-        sessionState.out.println("The CLI is deprecated and will be removed in Cassandra 3.0.  Consider migrating to cqlsh.");
+        sessionState.out.println("The CLI is deprecated and will be removed in Cassandra 2.2.  Consider migrating to cqlsh.");
         sessionState.out.println("CQL is fully backwards compatible with Thrift data; see http://www.datastax.com/dev/blog/thrift-to-cql3\n");
 
         sessionState.out.println(getHelp().banner);
@@ -1318,12 +1320,14 @@ public class CliClient
                 if (threshold <= 0)
                     throw new RuntimeException("Disabling compaction by setting min/max compaction thresholds to 0 has been deprecated, set compaction_strategy_options={'enabled':false} instead");
                 cfDef.setMin_compaction_threshold(threshold);
+                cfDef.putToCompaction_strategy_options(CFPropDefs.KW_MINCOMPACTIONTHRESHOLD, Integer.toString(threshold));
                 break;
             case MAX_COMPACTION_THRESHOLD:
                 threshold = Integer.parseInt(mValue);
                 if (threshold <= 0)
                     throw new RuntimeException("Disabling compaction by setting min/max compaction thresholds to 0 has been deprecated, set compaction_strategy_options={'enabled':false} instead");
                 cfDef.setMax_compaction_threshold(Integer.parseInt(mValue));
+                cfDef.putToCompaction_strategy_options(CFPropDefs.KW_MAXCOMPACTIONTHRESHOLD, Integer.toString(threshold));
                 break;
             case REPLICATE_ON_WRITE:
                 cfDef.setReplicate_on_write(Boolean.parseBoolean(mValue));
@@ -1658,6 +1662,7 @@ public class CliClient
             }
             catch (Exception ne)
             {
+                JVMStabilityInspector.inspectThrowable(ne);
                 String functions = Function.getFunctionNames();
                 sessionState.out.println("Type '" + defaultType + "' was not found. Available: " + functions
                                          + " Or any class which extends o.a.c.db.marshal.AbstractType.");
@@ -1816,11 +1821,9 @@ public class CliClient
 
         writeAttr(output, false, "read_repair_chance", cfDef.read_repair_chance);
         writeAttr(output, false, "dclocal_read_repair_chance", cfDef.dclocal_read_repair_chance);
-        writeAttr(output, false, "populate_io_cache_on_flush", cfDef.populate_io_cache_on_flush);
         writeAttr(output, false, "gc_grace", cfDef.gc_grace_seconds);
         writeAttr(output, false, "min_compaction_threshold", cfDef.min_compaction_threshold);
         writeAttr(output, false, "max_compaction_threshold", cfDef.max_compaction_threshold);
-        writeAttr(output, false, "replicate_on_write", cfDef.replicate_on_write);
         writeAttr(output, false, "compaction_strategy", cfDef.compaction_strategy);
         writeAttr(output, false, "caching", cfDef.caching);
         writeAttr(output, false, "cells_per_row_to_cache", cfDef.cells_per_row_to_cache);
@@ -2189,8 +2192,6 @@ public class CliClient
         sessionState.out.printf("      Compaction min/max thresholds: %s/%s%n", cf_def.min_compaction_threshold, cf_def.max_compaction_threshold);
         sessionState.out.printf("      Read repair chance: %s%n", cf_def.read_repair_chance);
         sessionState.out.printf("      DC Local Read repair chance: %s%n", cf_def.dclocal_read_repair_chance);
-        sessionState.out.printf("      Populate IO Cache on flush: %b%n", cf_def.populate_io_cache_on_flush);
-        sessionState.out.printf("      Replicate on write: %s%n", cf_def.replicate_on_write);
         sessionState.out.printf("      Caching: %s%n", cf_def.caching);
         sessionState.out.printf("      Default time to live: %s%n", cf_def.default_time_to_live);
         sessionState.out.printf("      Bloom Filter FP chance: %s%n", cf_def.isSetBloom_filter_fp_chance() ? cf_def.bloom_filter_fp_chance : "default");

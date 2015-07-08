@@ -21,15 +21,18 @@ package org.apache.cassandra.stress.util;
  */
 
 
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.collect.Iterators;
 
 import com.datastax.driver.core.Host;
 import com.datastax.driver.core.Metadata;
-import com.google.common.collect.Iterators;
 import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -41,17 +44,29 @@ public class SmartThriftClient implements ThriftClient
     final String keyspace;
     final Metadata metadata;
     final StressSettings settings;
-    final ConcurrentHashMap<Host, ConcurrentLinkedQueue<Client>> cache = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<InetAddress, ConcurrentLinkedQueue<Client>> cache = new ConcurrentHashMap<>();
 
     final AtomicInteger queryIdCounter = new AtomicInteger();
     final ConcurrentHashMap<Integer, String> queryStrings = new ConcurrentHashMap<>();
     final ConcurrentHashMap<String, Integer> queryIds = new ConcurrentHashMap<>();
+    final Set<InetAddress> whiteset;
+    final List<InetAddress> whitelist;
 
     public SmartThriftClient(StressSettings settings, String keyspace, Metadata metadata)
     {
         this.metadata = metadata;
         this.keyspace = keyspace;
         this.settings = settings;
+        if (!settings.node.isWhiteList)
+        {
+            whiteset = null;
+            whitelist = null;
+        }
+        else
+        {
+            whiteset = settings.node.resolveAllSpecified();
+            whitelist = Arrays.asList(whiteset.toArray(new InetAddress[0]));
+        }
     }
 
     private final AtomicInteger roundrobin = new AtomicInteger();
@@ -63,21 +78,23 @@ public class SmartThriftClient implements ThriftClient
             return r;
         r = queryIdCounter.incrementAndGet();
         if (queryIds.putIfAbsent(query, r) == null)
+        {
+            queryStrings.put(r, query);
             return r;
-        queryStrings.put(r, query);
+        }
         return queryIds.get(query);
     }
 
     final class Client
     {
         final Cassandra.Client client;
-        final Host host;
+        final InetAddress server;
         final Map<Integer, Integer> queryMap = new HashMap<>();
 
-        Client(Cassandra.Client client, Host host)
+        Client(Cassandra.Client client, InetAddress server)
         {
             this.client = client;
-            this.host = host;
+            this.server = server;
         }
 
         Integer get(Integer id, boolean cql3) throws TException
@@ -109,22 +126,33 @@ public class SmartThriftClient implements ThriftClient
     private Client get(ByteBuffer pk)
     {
         Set<Host> hosts = metadata.getReplicas(metadata.quote(keyspace), pk);
-        int pos = roundrobin.incrementAndGet() % hosts.size();
-        if (pos < 0)
-            pos = -pos;
-        Host host = Iterators.get(hosts.iterator(), pos);
-        ConcurrentLinkedQueue<Client> q = cache.get(host);
+        InetAddress address = null;
+        if (hosts.size() > 0)
+        {
+            int pos = roundrobin.incrementAndGet() % hosts.size();
+            for (int i = 0 ; address == null && i < hosts.size() ; i++)
+            {
+                if (pos < 0)
+                    pos = -pos;
+                Host host = Iterators.get(hosts.iterator(), (pos + i) % hosts.size());
+                if (whiteset == null || whiteset.contains(host.getAddress()))
+                    address = host.getAddress();
+            }
+        }
+        if (address == null)
+            address = whitelist.get(ThreadLocalRandom.current().nextInt(whitelist.size()));
+        ConcurrentLinkedQueue<Client> q = cache.get(address);
         if (q == null)
         {
             ConcurrentLinkedQueue<Client> newQ = new ConcurrentLinkedQueue<Client>();
-            q = cache.putIfAbsent(host, newQ);
+            q = cache.putIfAbsent(address, newQ);
             if (q == null)
                 q = newQ;
         }
         Client tclient = q.poll();
         if (tclient != null)
             return tclient;
-        return new Client(settings.getRawThriftClient(host.getAddress().getHostAddress()), host);
+        return new Client(settings.getRawThriftClient(address.getHostAddress()), address);
     }
 
     @Override
@@ -138,7 +166,7 @@ public class SmartThriftClient implements ThriftClient
                 client.client.batch_mutate(Collections.singletonMap(e.getKey(), e.getValue()), consistencyLevel);
             } finally
             {
-                cache.get(client.host).add(client);
+                cache.get(client.server).add(client);
             }
         }
     }
@@ -152,7 +180,7 @@ public class SmartThriftClient implements ThriftClient
             return client.client.get_slice(key, parent, predicate, consistencyLevel);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 
@@ -165,7 +193,7 @@ public class SmartThriftClient implements ThriftClient
             client.client.insert(key, column_parent, column, consistency_level);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 
@@ -178,7 +206,7 @@ public class SmartThriftClient implements ThriftClient
             return client.client.execute_cql_query(ByteBufferUtil.bytes(query), compression);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 
@@ -191,7 +219,7 @@ public class SmartThriftClient implements ThriftClient
             return client.client.execute_cql3_query(ByteBufferUtil.bytes(query), compression, consistency);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 
@@ -210,7 +238,7 @@ public class SmartThriftClient implements ThriftClient
             return client.client.execute_prepared_cql3_query(client.get(queryId, true), values, consistency);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 
@@ -229,7 +257,7 @@ public class SmartThriftClient implements ThriftClient
             return client.client.execute_prepared_cql_query(client.get(queryId, true), values);
         } finally
         {
-            cache.get(client.host).add(client);
+            cache.get(client.server).add(client);
         }
     }
 

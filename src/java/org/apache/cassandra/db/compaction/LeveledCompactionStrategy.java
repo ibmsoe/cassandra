@@ -32,14 +32,10 @@ import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableReader;
-import org.apache.cassandra.notifications.INotification;
-import org.apache.cassandra.notifications.INotificationConsumer;
-import org.apache.cassandra.notifications.SSTableAddedNotification;
-import org.apache.cassandra.notifications.SSTableListChangedNotification;
-import org.apache.cassandra.notifications.SSTableRepairStatusChanged;
 
-public class LeveledCompactionStrategy extends AbstractCompactionStrategy implements INotificationConsumer
+public class LeveledCompactionStrategy extends AbstractCompactionStrategy
 {
     private static final Logger logger = LoggerFactory.getLogger(LeveledCompactionStrategy.class);
     private static final String SSTABLE_SIZE_OPTION = "sstable_size_in_mb";
@@ -71,24 +67,8 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         }
         maxSSTableSizeInMB = configuredMaxSSTableSize;
 
-        manifest = LeveledManifest.create(cfs, this.maxSSTableSizeInMB, cfs.getSSTables(), localOptions);
+        manifest = new LeveledManifest(cfs, this.maxSSTableSizeInMB, localOptions);
         logger.debug("Created {}", manifest);
-    }
-
-    @Override
-    public void startup()
-    {
-        super.startup();
-        cfs.getDataTracker().subscribe(this);
-        logger.debug("{} subscribed to the data tracker.", this);
-    }
-
-    @Override
-    public void shutdown()
-    {
-        super.shutdown();
-        cfs.getDataTracker().unsubscribe(this);
-        logger.debug("{} unsubscribed from the data tracker.", this);
     }
 
     public int getLevelSize(int i)
@@ -175,73 +155,85 @@ public class LeveledCompactionStrategy extends AbstractCompactionStrategy implem
         return manifest.getEstimatedTasks();
     }
 
-    public void handleNotification(INotification notification, Object sender)
-    {
-        if (notification instanceof SSTableAddedNotification)
-        {
-            SSTableAddedNotification flushedNotification = (SSTableAddedNotification) notification;
-            manifest.add(flushedNotification.added);
-        }
-        else if (notification instanceof SSTableListChangedNotification)
-        {
-            SSTableListChangedNotification listChangedNotification = (SSTableListChangedNotification) notification;
-            manifest.replace(listChangedNotification.removed, listChangedNotification.added);
-        }
-        else if (notification instanceof SSTableRepairStatusChanged)
-        {
-            manifest.repairStatusChanged(((SSTableRepairStatusChanged) notification).sstable);
-        }
-    }
-
     public long getMaxSSTableBytes()
     {
         return maxSSTableSizeInMB * 1024L * 1024L;
     }
 
-    public List<ICompactionScanner> getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+    public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
     {
         Multimap<Integer, SSTableReader> byLevel = ArrayListMultimap.create();
         for (SSTableReader sstable : sstables)
         {
-            if (manifest.hasRepairedData() && !sstable.isRepaired())
-                byLevel.get(0).add(sstable);
-            else
-                byLevel.get(sstable.getSSTableLevel()).add(sstable);
+            byLevel.get(sstable.getSSTableLevel()).add(sstable);
         }
 
-        List<ICompactionScanner> scanners = new ArrayList<ICompactionScanner>(sstables.size());
-        for (Integer level : byLevel.keySet())
+        List<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>(sstables.size());
+        try
         {
-            // level can be -1 when sstables are added to DataTracker but not to LeveledManifest
-            // since we don't know which level those sstable belong yet, we simply do the same as L0 sstables.
-            if (level <= 0)
+            for (Integer level : byLevel.keySet())
             {
-                // L0 makes no guarantees about overlapping-ness.  Just create a direct scanner for each
-                for (SSTableReader sstable : byLevel.get(level))
-                    scanners.add(sstable.getScanner(range, CompactionManager.instance.getRateLimiter()));
-            }
-            else
-            {
-                // Create a LeveledScanner that only opens one sstable at a time, in sorted order
-                List<SSTableReader> intersecting = LeveledScanner.intersecting(byLevel.get(level), range);
-                if (!intersecting.isEmpty())
-                    scanners.add(new LeveledScanner(intersecting, range));
+                // level can be -1 when sstables are added to DataTracker but not to LeveledManifest
+                // since we don't know which level those sstable belong yet, we simply do the same as L0 sstables.
+                if (level <= 0)
+                {
+                    // L0 makes no guarantees about overlapping-ness.  Just create a direct scanner for each
+                    for (SSTableReader sstable : byLevel.get(level))
+                        scanners.add(sstable.getScanner(range, CompactionManager.instance.getRateLimiter()));
+                }
+                else
+                {
+                    // Create a LeveledScanner that only opens one sstable at a time, in sorted order
+                    List<SSTableReader> intersecting = LeveledScanner.intersecting(byLevel.get(level), range);
+                    if (!intersecting.isEmpty())
+                        scanners.add(new LeveledScanner(intersecting, range));
+                }
             }
         }
+        catch (Throwable t)
+        {
+            try
+            {
+                new ScannerList(scanners).close();
+            }
+            catch (Throwable t2)
+            {
+                t.addSuppressed(t2);
+            }
+            throw t;
+        }
 
-        return scanners;
+        return new ScannerList(scanners);
+    }
+
+    @Override
+    public void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
+    {
+        manifest.replace(removed, added);
+    }
+
+    @Override
+    public void addSSTable(SSTableReader added)
+    {
+        manifest.add(added);
+    }
+
+    @Override
+    public void removeSSTable(SSTableReader sstable)
+    {
+        manifest.remove(sstable);
     }
 
     // Lazily creates SSTableBoundedScanner for sstable that are assumed to be from the
     // same level (e.g. non overlapping) - see #4142
-    private static class LeveledScanner extends AbstractIterator<OnDiskAtomIterator> implements ICompactionScanner
+    private static class LeveledScanner extends AbstractIterator<OnDiskAtomIterator> implements ISSTableScanner
     {
         private final Range<Token> range;
         private final List<SSTableReader> sstables;
         private final Iterator<SSTableReader> sstableIterator;
         private final long totalLength;
 
-        private ICompactionScanner currentScanner;
+        private ISSTableScanner currentScanner;
         private long positionOffset;
 
         public LeveledScanner(Collection<SSTableReader> sstables, Range<Token> range)

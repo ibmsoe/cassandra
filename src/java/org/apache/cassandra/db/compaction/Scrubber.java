@@ -21,7 +21,9 @@ import java.nio.ByteBuffer;
 import java.io.*;
 import java.util.*;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
+import com.google.common.collect.Sets;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.io.sstable.*;
@@ -29,6 +31,7 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
 
 public class Scrubber implements Closeable
@@ -37,6 +40,7 @@ public class Scrubber implements Closeable
     private final SSTableReader sstable;
     private final File destination;
     private final boolean skipCorrupted;
+    public final boolean validateColumns;
 
     private final CompactionController controller;
     private final boolean isCommutative;
@@ -55,6 +59,11 @@ public class Scrubber implements Closeable
     private int badRows;
     private int emptyRows;
 
+    private ByteBuffer currentIndexKey;
+    private ByteBuffer nextIndexKey;
+    long currentRowPositionFromIndex;
+    long nextRowPositionFromIndex;
+
     private final OutputHandler outputHandler;
 
     private static final Comparator<Row> rowComparator = new Comparator<Row>()
@@ -66,31 +75,43 @@ public class Scrubber implements Closeable
     };
     private final SortedSet<Row> outOfOrderRows = new TreeSet<>(rowComparator);
 
-    public Scrubber(ColumnFamilyStore cfs, SSTableReader sstable, boolean skipCorrupted, boolean isOffline) throws IOException
+    public Scrubber(ColumnFamilyStore cfs, SSTableReader sstable, boolean skipCorrupted, boolean isOffline, boolean checkData) throws IOException
     {
-        this(cfs, sstable, skipCorrupted, new OutputHandler.LogOutput(), isOffline);
+        this(cfs, sstable, skipCorrupted, new OutputHandler.LogOutput(), isOffline, checkData);
     }
 
-    public Scrubber(ColumnFamilyStore cfs, SSTableReader sstable, boolean skipCorrupted, OutputHandler outputHandler, boolean isOffline) throws IOException
+    public Scrubber(ColumnFamilyStore cfs, SSTableReader sstable, boolean skipCorrupted, OutputHandler outputHandler, boolean isOffline, boolean checkData) throws IOException
     {
         this.cfs = cfs;
         this.sstable = sstable;
         this.outputHandler = outputHandler;
         this.skipCorrupted = skipCorrupted;
         this.isOffline = isOffline;
+        this.validateColumns = checkData;
+
+        List<SSTableReader> toScrub = Collections.singletonList(sstable);
 
         // Calculate the expected compacted filesize
-        this.destination = cfs.directories.getDirectoryForNewSSTables();
+        this.destination = cfs.directories.getWriteableLocationAsFile(cfs.getExpectedCompactedFileSize(toScrub, OperationType.SCRUB));
         if (destination == null)
             throw new IOException("disk full");
 
-        List<SSTableReader> toScrub = Collections.singletonList(sstable);
         // If we run scrub offline, we should never purge tombstone, as we cannot know if other sstable have data that the tombstone deletes.
         this.controller = isOffline
                         ? new ScrubController(cfs)
                         : new CompactionController(cfs, Collections.singleton(sstable), CompactionManager.getDefaultGcBefore(cfs));
         this.isCommutative = cfs.metadata.isCounter();
-        this.expectedBloomFilterSize = Math.max(cfs.metadata.getMinIndexInterval(), (int)(SSTableReader.getApproximateKeyCount(toScrub)));
+
+        boolean hasIndexFile = (new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX))).exists();
+        if (!hasIndexFile)
+        {
+            // if there's any corruption in the -Data.db then rows can't be skipped over. but it's worth a shot.
+            outputHandler.warn("Missing component: " + sstable.descriptor.filenameFor(Component.PRIMARY_INDEX));
+        }
+
+        this.expectedBloomFilterSize = Math.max(
+            cfs.metadata.getMinIndexInterval(),
+            hasIndexFile ? (int)(SSTableReader.getApproximateKeyCount(toScrub)) : 0);
 
         // loop through each row, deserializing to check for damage.
         // we'll also loop through the index at the same time, using the position from the index to recover if the
@@ -99,17 +120,26 @@ public class Scrubber implements Closeable
         this.dataFile = isOffline
                         ? sstable.openDataReader()
                         : sstable.openDataReader(CompactionManager.instance.getRateLimiter());
-        this.indexFile = RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)));
+
+        this.indexFile = hasIndexFile
+                ? RandomAccessReader.open(new File(sstable.descriptor.filenameFor(Component.PRIMARY_INDEX)))
+                : null;
+
         this.scrubInfo = new ScrubInfo(dataFile, sstable);
+
+        this.currentRowPositionFromIndex = 0;
+        this.nextRowPositionFromIndex = 0;
     }
 
     public void scrub()
     {
         outputHandler.output(String.format("Scrubbing %s (%s bytes)", sstable, dataFile.length()));
-        SSTableRewriter writer = new SSTableRewriter(cfs, new HashSet<>(Collections.singleton(sstable)), sstable.maxDataAge, OperationType.SCRUB, isOffline);
+        Set<SSTableReader> oldSSTable = Sets.newHashSet(sstable);
+        SSTableRewriter writer = new SSTableRewriter(cfs, oldSSTable, sstable.maxDataAge, isOffline);
         try
         {
-            ByteBuffer nextIndexKey = ByteBufferUtil.readWithShortLength(indexFile);
+            nextIndexKey = indexAvailable() ? ByteBufferUtil.readWithShortLength(indexFile) : null;
+            if (indexAvailable())
             {
                 // throw away variable so we don't have a side effect in the assert
                 long firstRowPositionFromIndex = sstable.metadata.comparator.rowIndexEntrySerializer().deserialize(indexFile, sstable.descriptor.version).position;
@@ -124,6 +154,7 @@ public class Scrubber implements Closeable
             {
                 if (scrubInfo.isStopRequested())
                     throw new CompactionInterruptedException(scrubInfo.getCompactionInfo());
+
                 long rowStart = dataFile.getFilePointer();
                 outputHandler.debug("Reading row at " + rowStart);
 
@@ -139,43 +170,46 @@ public class Scrubber implements Closeable
                     // check for null key below
                 }
 
-                ByteBuffer currentIndexKey = nextIndexKey;
-                long nextRowPositionFromIndex;
-                try
-                {
-                    nextIndexKey = indexFile.isEOF() ? null : ByteBufferUtil.readWithShortLength(indexFile);
-                    nextRowPositionFromIndex = indexFile.isEOF()
-                                             ? dataFile.length()
-                                             : sstable.metadata.comparator.rowIndexEntrySerializer().deserialize(indexFile, sstable.descriptor.version).position;
-                }
-                catch (Throwable th)
-                {
-                    outputHandler.warn("Error reading index file", th);
-                    nextIndexKey = null;
-                    nextRowPositionFromIndex = dataFile.length();
-                }
+                updateIndexKey();
 
                 long dataStart = dataFile.getFilePointer();
-                long dataStartFromIndex = currentIndexKey == null
-                                        ? -1
-                                        : rowStart + 2 + currentIndexKey.remaining();
-                long dataSizeFromIndex = nextRowPositionFromIndex - dataStartFromIndex;
+
+                long dataStartFromIndex = -1;
+                long dataSizeFromIndex = -1;
+                if (currentIndexKey != null)
+                {
+                    dataStartFromIndex = currentRowPositionFromIndex + 2 + currentIndexKey.remaining();
+                    dataSizeFromIndex = nextRowPositionFromIndex - dataStartFromIndex;
+                }
 
                 dataSize = dataSizeFromIndex;
                 // avoid an NPE if key is null
                 String keyName = key == null ? "(unreadable key)" : ByteBufferUtil.bytesToHex(key.getKey());
                 outputHandler.debug(String.format("row %s is %s bytes", keyName, dataSize));
 
-                assert currentIndexKey != null || indexFile.isEOF();
+                assert currentIndexKey != null || !indexAvailable();
 
                 try
                 {
                     if (key == null)
                         throw new IOError(new IOException("Unable to read row key from data file"));
-                    if (dataSize > dataFile.length())
-                        throw new IOError(new IOException("Impossible row size " + dataSize));
 
-                    SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, dataSize, true);
+                    if (currentIndexKey != null && !key.getKey().equals(currentIndexKey))
+                    {
+                        throw new IOError(new IOException(String.format("Key from data file (%s) does not match key from index file (%s)",
+                                ByteBufferUtil.bytesToHex(key.getKey()), ByteBufferUtil.bytesToHex(currentIndexKey))));
+                    }
+
+                    if (dataSize > dataFile.length())
+                        throw new IOError(new IOException("Impossible row size (greater than file length): " + dataSize));
+
+                    if (indexFile != null && dataStart != dataStartFromIndex)
+                        outputHandler.warn(String.format("Data file row position %d differs from index file row position %d", dataStart, dataStartFromIndex));
+
+                    if (indexFile != null && dataSize != dataSizeFromIndex)
+                        outputHandler.warn(String.format("Data file row size %d different from index file row size %d", dataSize, dataSizeFromIndex));
+
+                    SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, dataSize, validateColumns);
                     if (prevKey != null && prevKey.compareTo(key) > 0)
                     {
                         saveOutOfOrderRow(prevKey, key, atoms);
@@ -187,9 +221,8 @@ public class Scrubber implements Closeable
                         emptyRows++;
                     else
                         goodRows++;
+
                     prevKey = key;
-                    if (!key.getKey().equals(currentIndexKey) || dataStart != dataStartFromIndex)
-                        outputHandler.warn("Index file contained a different key or row size; using key from data file");
                 }
                 catch (Throwable th)
                 {
@@ -204,7 +237,9 @@ public class Scrubber implements Closeable
                         key = sstable.partitioner.decorateKey(currentIndexKey);
                         try
                         {
-                            SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, dataSize, true);
+                            dataFile.seek(dataStartFromIndex);
+
+                            SSTableIdentityIterator atoms = new SSTableIdentityIterator(sstable, dataFile, key, dataSize, validateColumns);
                             if (prevKey != null && prevKey.compareTo(key) > 0)
                             {
                                 saveOutOfOrderRow(prevKey, key, atoms);
@@ -216,6 +251,7 @@ public class Scrubber implements Closeable
                                 emptyRows++;
                             else
                                 goodRows++;
+
                             prevKey = key;
                         }
                         catch (Throwable th2)
@@ -224,8 +260,8 @@ public class Scrubber implements Closeable
                             throwIfCommutative(key, th2);
 
                             outputHandler.warn("Retry failed too. Skipping to next row (retry's stacktrace follows)", th2);
-                            dataFile.seek(nextRowPositionFromIndex);
                             badRows++;
+                            seekToNextRow();
                         }
                     }
                     else
@@ -233,9 +269,9 @@ public class Scrubber implements Closeable
                         throwIfCommutative(key, th);
 
                         outputHandler.warn("Row starting at position " + dataStart + " is unreadable; skipping to next");
-                        if (currentIndexKey != null)
-                            dataFile.seek(nextRowPositionFromIndex);
                         badRows++;
+                        if (currentIndexKey != null)
+                            seekToNextRow();
                     }
                 }
             }
@@ -254,9 +290,11 @@ public class Scrubber implements Closeable
             }
 
             // finish obsoletes the old sstable
-            writer.finish(!isOffline, badRows > 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt);
-            if (!writer.finished().isEmpty())
-                newSstable = writer.finished().get(0);
+            List<SSTableReader> finished = writer.finish(badRows > 0 ? ActiveRepairService.UNREPAIRED_SSTABLE : sstable.getSSTableMetadata().repairedAt);
+            if (!finished.isEmpty())
+                newSstable = finished.get(0);
+            if (!isOffline)
+                cfs.getDataTracker().markCompactedSSTablesReplaced(oldSSTable, finished, OperationType.SCRUB);
         }
         catch (Throwable t)
         {
@@ -280,6 +318,52 @@ public class Scrubber implements Closeable
             outputHandler.output("Scrub of " + sstable + " complete: " + goodRows + " rows in new sstable and " + emptyRows + " empty (tombstoned) rows dropped");
             if (badRows > 0)
                 outputHandler.warn("Unable to recover " + badRows + " rows that were skipped.  You can attempt manual recovery from the pre-scrub snapshot.  You can also run nodetool repair to transfer the data from a healthy replica, if any");
+        }
+    }
+
+    private void updateIndexKey()
+    {
+        currentIndexKey = nextIndexKey;
+        currentRowPositionFromIndex = nextRowPositionFromIndex;
+        try
+        {
+            nextIndexKey = !indexAvailable() ? null : ByteBufferUtil.readWithShortLength(indexFile);
+
+            nextRowPositionFromIndex = !indexAvailable()
+                    ? dataFile.length()
+                    : sstable.metadata.comparator.rowIndexEntrySerializer().deserialize(indexFile, sstable.descriptor.version).position;
+        }
+        catch (Throwable th)
+        {
+            JVMStabilityInspector.inspectThrowable(th);
+            outputHandler.warn("Error reading index file", th);
+            nextIndexKey = null;
+            nextRowPositionFromIndex = dataFile.length();
+        }
+    }
+
+    private boolean indexAvailable()
+    {
+        return indexFile != null && !indexFile.isEOF();
+    }
+
+    private void seekToNextRow()
+    {
+        while(nextRowPositionFromIndex < dataFile.length())
+        {
+            try
+            {
+                dataFile.seek(nextRowPositionFromIndex);
+                return;
+            }
+            catch (Throwable th)
+            {
+                throwIfFatal(th);
+                outputHandler.warn(String.format("Failed to seek to next row position %d", nextRowPositionFromIndex), th);
+                badRows++;
+            }
+
+            updateIndexKey();
         }
     }
 
@@ -376,6 +460,27 @@ public class Scrubber implements Closeable
         public long maxPurgeableTimestamp(DecoratedKey key)
         {
             return Long.MIN_VALUE;
+        }
+    }
+
+    @VisibleForTesting
+    public ScrubResult scrubWithResult()
+    {
+        scrub();
+        return new ScrubResult(this);
+    }
+
+    public static final class ScrubResult
+    {
+        public final int goodRows;
+        public final int badRows;
+        public final int emptyRows;
+
+        public ScrubResult(Scrubber scrubber)
+        {
+            this.goodRows = scrubber.goodRows;
+            this.badRows = scrubber.badRows;
+            this.emptyRows = scrubber.emptyRows;
         }
     }
 }

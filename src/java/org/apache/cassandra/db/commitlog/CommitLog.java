@@ -25,9 +25,12 @@ import java.util.*;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
-import org.apache.commons.lang3.StringUtils;
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.commons.lang3.StringUtils;
+
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
@@ -35,6 +38,8 @@ import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.DataOutputByteBuffer;
 import org.apache.cassandra.metrics.CommitLogMetrics;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.PureJavaCrc32;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.*;
@@ -89,9 +94,7 @@ public class CommitLog implements CommitLogMBean
      */
     public int recover() throws IOException
     {
-        archiver.maybeRestoreArchive();
-
-        File[] files = new File(DatabaseDescriptor.getCommitLogLocation()).listFiles(new FilenameFilter()
+        FilenameFilter unmanagedFilesFilter = new FilenameFilter()
         {
             public boolean accept(File dir, String name)
             {
@@ -100,8 +103,19 @@ public class CommitLog implements CommitLogMBean
                 // ahead and allow writes before recover(), and just skip active segments when we do.
                 return CommitLogDescriptor.isValid(name) && !instance.allocator.manages(name);
             }
-        });
+        };
 
+        // submit all existing files in the commit log dir for archiving prior to recovery - CASSANDRA-6904
+        for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).listFiles(unmanagedFilesFilter))
+        {
+            archiver.maybeArchive(file.getPath(), file.getName());
+            archiver.maybeWaitForArchiving(file.getName());
+        }
+
+        assert archiver.archivePending.isEmpty() : "Not all commit log archive tasks were completed before restore";
+        archiver.maybeRestoreArchive();
+
+        File[] files = new File(DatabaseDescriptor.getCommitLogLocation()).listFiles(unmanagedFilesFilter);
         int replayed = 0;
         if (files.length == 0)
         {
@@ -144,8 +158,8 @@ public class CommitLog implements CommitLogMBean
     }
 
     /**
-     * @return a Future representing a ReplayPosition such that when it is ready,
-     * all Allocations created prior to the getContext call will be written to the log
+     * @return a ReplayPosition which, if >= one returned from add(), implies add() was started
+     * (but not necessarily finished) prior to this call
      */
     public ReplayPosition getContext()
     {
@@ -155,9 +169,17 @@ public class CommitLog implements CommitLogMBean
     /**
      * Flushes all dirty CFs, waiting for them to free and recycle any segments they were retaining
      */
+    public void forceRecycleAllSegments(Iterable<UUID> droppedCfs)
+    {
+        allocator.forceRecycleAll(droppedCfs);
+    }
+
+    /**
+     * Flushes all dirty CFs, waiting for them to free and recycle any segments they were retaining
+     */
     public void forceRecycleAllSegments()
     {
-        allocator.forceRecycleAll();
+        allocator.forceRecycleAll(Collections.<UUID>emptyList());
     }
 
     /**
@@ -189,12 +211,6 @@ public class CommitLog implements CommitLogMBean
      */
     public ReplayPosition add(Mutation mutation)
     {
-        Allocation alloc = add(mutation, new Allocation());
-        return alloc.getReplayPosition();
-    }
-
-    private Allocation add(Mutation mutation, Allocation alloc)
-    {
         assert mutation != null;
 
         long size = Mutation.serializer.serializedSize(mutation, MessagingService.current_version);
@@ -206,7 +222,7 @@ public class CommitLog implements CommitLogMBean
                                                              totalSize, MAX_MUTATION_SIZE));
         }
 
-        allocator.allocate(mutation, (int) totalSize, alloc);
+        Allocation alloc = allocator.allocate(mutation, (int) totalSize);
         try
         {
             PureJavaCrc32 checksum = new PureJavaCrc32();
@@ -234,14 +250,7 @@ public class CommitLog implements CommitLogMBean
         }
 
         executor.finishWriteFor(alloc);
-        return alloc;
-    }
-
-    public void discardColumnFamily(final UUID cfId)
-    {
-        ReplayPosition context = getContext();
-        for (CommitLogSegment cls : allocator.getActiveSegments())
-            cls.markClean(cfId, context);
+        return alloc.getReplayPosition();
     }
 
     /**
@@ -302,6 +311,36 @@ public class CommitLog implements CommitLogMBean
         return metrics.totalCommitLogSize.value();
     }
 
+    @Override
+    public String getArchiveCommand()
+    {
+        return archiver.archiveCommand;
+    }
+
+    @Override
+    public String getRestoreCommand()
+    {
+        return archiver.restoreCommand;
+    }
+
+    @Override
+    public String getRestoreDirectories()
+    {
+        return archiver.restoreDirectories;
+    }
+
+    @Override
+    public long getRestorePointInTime()
+    {
+        return archiver.restorePointInTime;
+    }
+
+    @Override
+    public String getRestorePrecision()
+    {
+        return archiver.precision.toString();
+    }
+
     public List<String> getActiveSegmentNames()
     {
         List<String> segmentNames = new ArrayList<>();
@@ -343,4 +382,26 @@ public class CommitLog implements CommitLogMBean
     {
         return allocator.getActiveSegments().size();
     }
+
+    @VisibleForTesting
+    public static boolean handleCommitError(String message, Throwable t)
+    {
+        JVMStabilityInspector.inspectCommitLogThrowable(t);
+        switch (DatabaseDescriptor.getCommitFailurePolicy())
+        {
+            // Needed here for unit tests to not fail on default assertion
+            case die:
+            case stop:
+                StorageService.instance.stopTransports();
+            case stop_commit:
+                logger.error(String.format("%s. Commit disk failure policy is %s; terminating thread", message, DatabaseDescriptor.getCommitFailurePolicy()), t);
+                return false;
+            case ignore:
+                logger.error(message, t);
+                return true;
+            default:
+                throw new AssertionError(DatabaseDescriptor.getCommitFailurePolicy());
+        }
+    }
+
 }

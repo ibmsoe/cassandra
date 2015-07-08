@@ -23,9 +23,12 @@ import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.db.KeyspaceNotDefinedException;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 public class DropIndexStatement extends SchemaAlteringStatement
@@ -33,11 +36,30 @@ public class DropIndexStatement extends SchemaAlteringStatement
     public final String indexName;
     public final boolean ifExists;
 
+    // initialized in announceMigration()
+    private String indexedCF;
+
     public DropIndexStatement(IndexName indexName, boolean ifExists)
     {
         super(indexName.getCfName());
         this.indexName = indexName.getIdx();
         this.ifExists = ifExists;
+    }
+
+    public String columnFamily()
+    {
+        if (indexedCF != null)
+            return indexedCF;
+
+        try
+        {
+            CFMetaData cfm = findIndexedCF();
+            return cfm == null ? null : cfm.cfName;
+        }
+        catch (InvalidRequestException ire)
+        {
+            throw new RuntimeException(ire);
+        }
     }
 
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
@@ -54,20 +76,29 @@ public class DropIndexStatement extends SchemaAlteringStatement
         // validated in findIndexedCf()
     }
 
-    public ResultMessage.SchemaChange.Change changeType()
+    public Event.SchemaChange changeEvent()
     {
         // Dropping an index is akin to updating the CF
-        return ResultMessage.SchemaChange.Change.UPDATED;
+        return new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 
-    public void announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    @Override
+    public ResultMessage execute(QueryState state, QueryOptions options) throws RequestValidationException
+    {
+        announceMigration(false);
+        return indexedCF == null ? null : new ResultMessage.SchemaChange(changeEvent());
+    }
+
+    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         CFMetaData cfm = findIndexedCF();
         if (cfm == null)
-            return;
+            return false;
 
         CFMetaData updatedCfm = updateCFMetadata(cfm);
+        indexedCF = updatedCfm.cfName;
         MigrationManager.announceColumnFamilyUpdate(updatedCfm, false, isLocalOnly);
+        return true;
     }
 
     private CFMetaData updateCFMetadata(CFMetaData cfm)
@@ -85,6 +116,8 @@ public class DropIndexStatement extends SchemaAlteringStatement
     private CFMetaData findIndexedCF() throws InvalidRequestException
     {
         KSMetaData ksm = Schema.instance.getKSMetaData(keyspace());
+        if (ksm == null)
+            throw new KeyspaceNotDefinedException("Keyspace " + keyspace() + " does not exist");
         for (CFMetaData cfm : ksm.cfMetaData().values())
         {
             if (findIndexedColumn(cfm) != null)
@@ -94,7 +127,7 @@ public class DropIndexStatement extends SchemaAlteringStatement
         if (ifExists)
             return null;
         else
-            throw new InvalidRequestException("Index '" + indexName + "' could not be found in any of the column families of keyspace '" + keyspace() + "'");
+            throw new InvalidRequestException("Index '" + indexName + "' could not be found in any of the tables of keyspace '" + keyspace() + '\'');
     }
 
     private ColumnDefinition findIndexedColumn(CFMetaData cfm)

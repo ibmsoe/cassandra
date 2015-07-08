@@ -23,17 +23,21 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Throwables;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.ArrayBackedSortedColumns;
+import org.apache.cassandra.db.Cell;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.io.compress.CompressionParameters;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * A SSTable writer that doesn't assume rows are in sorted order.
@@ -99,64 +103,96 @@ public class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
 
     protected void writeRow(DecoratedKey key, ColumnFamily columnFamily) throws IOException
     {
-        currentSize += key.getKey().remaining() + ColumnFamily.serializer.serializedSize(columnFamily, MessagingService.current_version) * 1.2;
-
-        if (currentSize > bufferSize)
-            sync();
+        // Nothing to do since we'll sync if needed in addColumn.
     }
 
-    protected ColumnFamily getColumnFamily()
+    @Override
+    protected void addColumn(Cell cell) throws IOException
+    {
+        super.addColumn(cell);
+        countColumn(cell);
+    }
+
+    protected void countColumn(Cell cell) throws IOException
+    {
+        currentSize += cell.serializedSize(metadata.comparator, TypeSizes.NATIVE);
+
+        // We don't want to sync in writeRow() only as this might blow up the bufferSize for wide rows.
+        if (currentSize > bufferSize)
+            replaceColumnFamily();
+    }
+
+    protected ColumnFamily getColumnFamily() throws IOException
     {
         ColumnFamily previous = buffer.get(currentKey);
         // If the CF already exist in memory, we'll just continue adding to it
         if (previous == null)
         {
-            previous = ArrayBackedSortedColumns.factory.create(metadata);
+            previous = createColumnFamily();
             buffer.put(currentKey, previous);
-        }
-        else
-        {
-            // We will reuse a CF that we have counted already. But because it will be easier to add the full size
-            // of the CF in the next writeRow call than to find out the delta, we just remove the size until that next call
-            currentSize -= currentKey.getKey().remaining() + ColumnFamily.serializer.serializedSize(previous, MessagingService.current_version) * 1.2;
+
+            // Since this new CF will be written by the next sync(), count its header. And a CF header
+            // on disk is:
+            //   - the row key: 2 bytes size + key size bytes
+            //   - the row level deletion infos: 4 + 8 bytes
+            currentSize += 14 + currentKey.getKey().remaining();
         }
         return previous;
+    }
+
+    protected ColumnFamily createColumnFamily() throws IOException
+    {
+        return ArrayBackedSortedColumns.factory.create(metadata);
     }
 
     public void close() throws IOException
     {
         sync();
+        put(SENTINEL);
         try
         {
-            writeQueue.put(SENTINEL);
             diskWriter.join();
         }
         catch (InterruptedException e)
         {
             throw new RuntimeException(e);
         }
-
-        checkForWriterException();
     }
 
-    private void sync() throws IOException
+    // This is overridden by CQLSSTableWriter to hold off replacing column family until the next iteration through
+    protected void replaceColumnFamily() throws IOException
+    {
+        sync();
+    }
+
+    protected void sync() throws IOException
     {
         if (buffer.isEmpty())
             return;
 
-        checkForWriterException();
-
-        try
-        {
-            writeQueue.put(buffer);
-        }
-        catch (InterruptedException e)
-        {
-            throw new RuntimeException(e);
-
-        }
+        columnFamily = null;
+        put(buffer);
         buffer = new Buffer();
         currentSize = 0;
+        columnFamily = getColumnFamily();
+        buffer.setFirstInsertedKey(currentKey);
+    }
+
+    private void put(Buffer buffer) throws IOException
+    {
+        while (true)
+        {
+            checkForWriterException();
+            try
+            {
+                if (writeQueue.offer(buffer, 1, TimeUnit.SECONDS))
+                    break;
+            }
+            catch (InterruptedException e)
+            {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     private void checkForWriterException() throws IOException
@@ -172,7 +208,17 @@ public class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
     }
 
     // typedef
-    private static class Buffer extends TreeMap<DecoratedKey, ColumnFamily> {}
+    private static class Buffer extends TreeMap<DecoratedKey, ColumnFamily> {
+        private DecoratedKey firstInsertedKey;
+
+        public void setFirstInsertedKey(DecoratedKey firstInsertedKey) {
+            this.firstInsertedKey = firstInsertedKey;
+        }
+
+        public DecoratedKey getFirstInsertedKey() {
+            return firstInsertedKey;
+        }
+    }
 
     private class DiskWriter extends Thread
     {
@@ -191,12 +237,18 @@ public class SSTableSimpleUnsortedWriter extends AbstractSSTableSimpleWriter
 
                     writer = getWriter();
                     for (Map.Entry<DecoratedKey, ColumnFamily> entry : b.entrySet())
-                        writer.append(entry.getKey(), entry.getValue());
+                    {
+                        if (entry.getValue().getColumnCount() > 0)
+                            writer.append(entry.getKey(), entry.getValue());
+                        else if (!entry.getKey().equals(b.getFirstInsertedKey()))
+                            throw new AssertionError("Empty partition");
+                    }
                     writer.close();
                 }
             }
             catch (Throwable e)
             {
+                JVMStabilityInspector.inspectThrowable(e);
                 if (writer != null)
                     writer.abort();
                 exception = e;

@@ -61,10 +61,15 @@ public class CompressedStreamReader extends StreamReader
     @Override
     public SSTableWriter read(ReadableByteChannel channel) throws IOException
     {
-        logger.info("reading file from {}, repairedAt = {}", session.peer, repairedAt);
+        logger.debug("reading file from {}, repairedAt = {}", session.peer, repairedAt);
         long totalSize = totalSize();
 
         Pair<String, String> kscf = Schema.instance.getCF(cfId);
+        if (kscf == null)
+        {
+            // schema was dropped during streaming
+            throw new IOException("CF " + cfId + " was dropped during streaming");
+        }
         ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
 
         SSTableWriter writer = createWriter(cfs, totalSize, repairedAt);

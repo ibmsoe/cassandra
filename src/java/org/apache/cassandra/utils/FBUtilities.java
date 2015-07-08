@@ -28,6 +28,7 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.text.NumberFormat;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -72,6 +73,10 @@ public class FBUtilities
 
     private static final String OPERATING_SYSTEM = System.getProperty("os.name").toLowerCase();
 
+    private static final boolean IS_WINDOWS = OPERATING_SYSTEM.contains("windows");
+
+    private static final boolean HAS_PROCFS = !IS_WINDOWS && (new File(File.separator + "proc")).exists();
+
     private static volatile InetAddress localInetAddress;
     private static volatile InetAddress broadcastInetAddress;
 
@@ -100,15 +105,6 @@ public class FBUtilities
         }
     };
 
-    private static final ThreadLocal<Random> localRandom = new ThreadLocal<Random>()
-    {
-        @Override
-        protected Random initialValue()
-        {
-            return new Random();
-        }
-    };
-
     public static final int MAX_UNSIGNED_SHORT = 0xFFFF;
 
     public static MessageDigest threadLocalMD5Digest()
@@ -126,11 +122,6 @@ public class FBUtilities
         {
             throw new RuntimeException("the requested digest algorithm (" + algorithm + ") is not available", nsae);
         }
-    }
-
-    public static Random threadLocalRandom()
-    {
-        return localRandom.get();
     }
 
     /**
@@ -338,7 +329,7 @@ public class FBUtilities
         if (scpurl == null)
             throw new ConfigurationException("unable to locate " + filename);
 
-        return scpurl.getFile();
+        return new File(scpurl.getFile()).getAbsolutePath();
     }
 
     public static File cassandraTriggerDir()
@@ -378,6 +369,7 @@ public class FBUtilities
         }
         catch (Exception e)
         {
+            JVMStabilityInspector.inspectThrowable(e);
             logger.warn("Unable to load version.properties", e);
             return "debug version";
         }
@@ -579,6 +571,15 @@ public class FBUtilities
         }
     }
 
+    public static String prettyPrintMemory(long size)
+    {
+        if (size >= 1 << 30)
+            return String.format("%.3fGiB", size / (double) (1 << 30));
+        if (size >= 1 << 20)
+            return String.format("%.3fMiB", size / (double) (1 << 20));
+        return String.format("%.3fKiB", size / (double) (1 << 10));
+    }
+
     /**
      * Starts and waits for the given @param pb to finish.
      * @throws java.io.IOException on non-zero exit code
@@ -689,9 +690,14 @@ public class FBUtilities
         return historyDir;
     }
 
-    public static boolean isUnix()
+    public static boolean isWindows()
     {
-        return OPERATING_SYSTEM.contains("nix") || OPERATING_SYSTEM.contains("nux") || OPERATING_SYSTEM.contains("aix");
+        return IS_WINDOWS;
+    }
+
+    public static boolean hasProcFS()
+    {
+        return HAS_PROCFS;
     }
 
     public static void updateWithShort(MessageDigest digest, int val)

@@ -22,17 +22,19 @@ import java.io.OutputStream;
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.common.util.concurrent.RateLimiter;
 import com.google.common.util.concurrent.Uninterruptibles;
-import org.apache.cassandra.stress.operations.*;
-import org.apache.cassandra.stress.settings.*;
+
+import org.apache.cassandra.stress.operations.OpDistribution;
+import org.apache.cassandra.stress.operations.OpDistributionFactory;
+import org.apache.cassandra.stress.settings.SettingsCommand;
+import org.apache.cassandra.stress.settings.StressSettings;
 import org.apache.cassandra.stress.util.JavaDriverClient;
 import org.apache.cassandra.stress.util.ThriftClient;
+import org.apache.cassandra.stress.util.TimingInterval;
 import org.apache.cassandra.transport.SimpleClient;
 
 public class StressAction implements Runnable
@@ -52,16 +54,25 @@ public class StressAction implements Runnable
         // creating keyspace and column families
         settings.maybeCreateKeyspaces();
 
-        warmup(settings.command.type, settings.command);
-
         output.println("Sleeping 2s...");
         Uninterruptibles.sleepUninterruptibly(2, TimeUnit.SECONDS);
 
+        if (!settings.command.noWarmup)
+            warmup(settings.command.getFactory(settings));
+        if (settings.command.truncate == SettingsCommand.TruncateWhen.ONCE)
+            settings.command.truncateTables(settings);
+
+        // TODO : move this to a new queue wrapper that gates progress based on a poisson (or configurable) distribution
+        RateLimiter rateLimiter = null;
+        if (settings.rate.opRateTargetPerSecond > 0)
+            rateLimiter = RateLimiter.create(settings.rate.opRateTargetPerSecond);
+
         boolean success;
-        if (settings.rate.auto)
-            success = runAuto();
+        if (settings.rate.minThreads > 0)
+            success = runMulti(settings.rate.auto, rateLimiter);
         else
-            success = null != run(settings.command.type, settings.rate.threadCount, settings.command.count, output);
+            success = null != run(settings.command.getFactory(settings), settings.rate.threadCount, settings.command.count,
+                                  settings.command.duration, rateLimiter, settings.command.durationUnits, output);
 
         if (success)
             output.println("END");
@@ -72,48 +83,48 @@ public class StressAction implements Runnable
     }
 
     // type provided separately to support recursive call for mixed command with each command type it is performing
-    private void warmup(Command type, SettingsCommand command)
+    private void warmup(OpDistributionFactory operations)
     {
         // warmup - do 50k iterations; by default hotspot compiles methods after 10k invocations
         PrintStream warmupOutput = new PrintStream(new OutputStream() { @Override public void write(int b) throws IOException { } } );
-        int iterations;
-        switch (type.category)
-        {
-            case BASIC:
-                iterations = 50000;
-                break;
-            case MIXED:
-                for (Command subtype : ((SettingsCommandMixed) command).getCommands())
-                    warmup(subtype, command);
-                return;
-            case MULTI:
-                int keysAtOnce = command.keysAtOnce;
-                iterations = Math.min(50000, (int) Math.ceil(500000d / keysAtOnce));
-                break;
-            default:
-                throw new IllegalStateException();
-        }
+        int iterations = 50000 * settings.node.nodes.size();
+        int threads = 100;
+        if (iterations > settings.command.count && settings.command.count > 0)
+            return;
 
-        // we need to warm up all the nodes in the cluster ideally, but we may not be the only stress instance;
-        // so warm up all the nodes we're speaking to only.
-        iterations *= settings.node.nodes.size();
-        output.println(String.format("Warming up %s with %d iterations...", type, iterations));
-        run(type, 20, iterations, warmupOutput);
+        if (settings.rate.maxThreads > 0)
+            threads = Math.min(threads, settings.rate.maxThreads);
+        if (settings.rate.threadCount > 0)
+            threads = Math.min(threads, settings.rate.threadCount);
+
+        for (OpDistributionFactory single : operations.each())
+        {
+            // we need to warm up all the nodes in the cluster ideally, but we may not be the only stress instance;
+            // so warm up all the nodes we're speaking to only.
+            output.println(String.format("Warming up %s with %d iterations...", single.desc(), iterations));
+            run(single, threads, iterations, 0, null, null, warmupOutput);
+        }
     }
 
     // TODO : permit varying more than just thread count
     // TODO : vary thread count based on percentage improvement of previous increment, not by fixed amounts
-    private boolean runAuto()
+    private boolean runMulti(boolean auto, RateLimiter rateLimiter)
     {
+        if (settings.command.targetUncertainty >= 0)
+            output.println("WARNING: uncertainty mode (err<) results in uneven workload between thread runs, so should be used for high level analysis only");
         int prevThreadCount = -1;
-        int threadCount = settings.rate.minAutoThreads;
+        int threadCount = settings.rate.minThreads;
         List<StressMetrics> results = new ArrayList<>();
         List<String> runIds = new ArrayList<>();
         do
         {
             output.println(String.format("Running with %d threadCount", threadCount));
 
-            StressMetrics result = run(settings.command.type, threadCount, settings.command.count, output);
+            if (settings.command.truncate == SettingsCommand.TruncateWhen.ALWAYS)
+                settings.command.truncateTables(settings);
+
+            StressMetrics result = run(settings.command.getFactory(settings), threadCount, settings.command.count,
+                                       settings.command.duration, rateLimiter, settings.command.durationUnits, output);
             if (result == null)
                 return false;
             results.add(result);
@@ -129,7 +140,7 @@ public class StressAction implements Runnable
             else
                 threadCount *= 1.5;
 
-            if (!results.isEmpty() && threadCount > settings.rate.maxAutoThreads)
+            if (!results.isEmpty() && threadCount > settings.rate.maxThreads)
                 break;
 
             if (settings.command.type.updates)
@@ -146,10 +157,10 @@ public class StressAction implements Runnable
                 }
             }
             // run until we have not improved throughput significantly for previous three runs
-        } while (hasAverageImprovement(results, 3, 0) && hasAverageImprovement(results, 5, settings.command.targetUncertainty));
+        } while (!auto || (hasAverageImprovement(results, 3, 0) && hasAverageImprovement(results, 5, settings.command.targetUncertainty)));
 
         // summarise all results
-        StressMetrics.summarise(runIds, results, output);
+        StressMetrics.summarise(runIds, results, output, settings.samples.historyCount);
         return true;
     }
 
@@ -163,37 +174,36 @@ public class StressAction implements Runnable
         double improvement = 0;
         for (int i = results.size() - count ; i < results.size() ; i++)
         {
-            double prev = results.get(i - 1).getTiming().getHistory().realOpRate();
-            double cur = results.get(i).getTiming().getHistory().realOpRate();
+            double prev = results.get(i - 1).getTiming().getHistory().opRate();
+            double cur = results.get(i).getTiming().getHistory().opRate();
             improvement += (cur - prev) / prev;
         }
         return improvement / count;
     }
 
-    private StressMetrics run(Command type, int threadCount, long opCount, PrintStream output)
+    private StressMetrics run(OpDistributionFactory operations, int threadCount, long opCount, long duration, RateLimiter rateLimiter, TimeUnit durationUnits, PrintStream output)
     {
-
         output.println(String.format("Running %s with %d threads %s",
-                type.toString(),
-                threadCount,
-                opCount > 0 ? " for " + opCount + " iterations" : "until stderr of mean < " + settings.command.targetUncertainty));
-        final WorkQueue workQueue;
+                                     operations.desc(),
+                                     threadCount,
+                                     durationUnits != null ? duration + " " + durationUnits.toString().toLowerCase()
+                                        : opCount > 0      ? "for " + opCount + " iteration"
+                                                           : "until stderr of mean < " + settings.command.targetUncertainty));
+        final WorkManager workManager;
         if (opCount < 0)
-            workQueue = new ContinuousWorkQueue(50);
+            workManager = new WorkManager.ContinuousWorkManager();
         else
-            workQueue = FixedWorkQueue.build(opCount);
+            workManager = new WorkManager.FixedWorkManager(opCount);
 
-        RateLimiter rateLimiter = null;
-        // TODO : move this to a new queue wrapper that gates progress based on a poisson (or configurable) distribution
-        if (settings.rate.opRateTargetPerSecond > 0)
-            rateLimiter = RateLimiter.create(settings.rate.opRateTargetPerSecond);
-
-        final StressMetrics metrics = new StressMetrics(output, settings.log.intervalMillis);
+        final StressMetrics metrics = new StressMetrics(output, settings.log.intervalMillis, settings);
 
         final CountDownLatch done = new CountDownLatch(threadCount);
         final Consumer[] consumers = new Consumer[threadCount];
         for (int i = 0; i < threadCount; i++)
-            consumers[i] = new Consumer(type, done, workQueue, metrics, rateLimiter);
+        {
+            consumers[i] = new Consumer(operations, done, workManager, metrics, rateLimiter,
+                                        settings.samples.liveCount / threadCount);
+        }
 
         // starting worker threadCount
         for (int i = 0; i < threadCount; i++)
@@ -201,7 +211,12 @@ public class StressAction implements Runnable
 
         metrics.start();
 
-        if (opCount <= 0)
+        if (durationUnits != null)
+        {
+            Uninterruptibles.sleepUninterruptibly(duration, durationUnits);
+            workManager.stop();
+        }
+        else if (opCount <= 0)
         {
             try
             {
@@ -209,14 +224,15 @@ public class StressAction implements Runnable
                         settings.command.minimumUncertaintyMeasurements,
                         settings.command.maximumUncertaintyMeasurements);
             } catch (InterruptedException e) { }
-            workQueue.stop();
+            workManager.stop();
         }
 
         try
         {
             done.await();
             metrics.stop();
-        } catch (InterruptedException e) {}
+        }
+        catch (InterruptedException e) {}
 
         if (metrics.wasCancelled())
             return null;
@@ -236,26 +252,29 @@ public class StressAction implements Runnable
     private class Consumer extends Thread
     {
 
-        private final Operation.State state;
+        private final OpDistribution operations;
+        private final StressMetrics metrics;
         private final RateLimiter rateLimiter;
         private volatile boolean success = true;
-        private final WorkQueue workQueue;
+        private final WorkManager workManager;
         private final CountDownLatch done;
 
-        public Consumer(Command type, CountDownLatch done, WorkQueue workQueue, StressMetrics metrics, RateLimiter rateLimiter)
+        public Consumer(OpDistributionFactory operations, CountDownLatch done, WorkManager workManager, StressMetrics metrics,
+                        RateLimiter rateLimiter, int sampleCount)
         {
             this.done = done;
             this.rateLimiter = rateLimiter;
-            this.workQueue = workQueue;
-            this.state = new Operation.State(type, settings, metrics);
+            this.workManager = workManager;
+            this.metrics = metrics;
+            this.operations = operations.get(metrics.getTiming(), sampleCount);
         }
 
         public void run()
         {
+            operations.initTimers();
 
             try
             {
-
                 SimpleClient sclient = null;
                 ThriftClient tclient = null;
                 JavaDriverClient jclient = null;
@@ -269,280 +288,57 @@ public class StressAction implements Runnable
                         sclient = settings.getSimpleNativeClient();
                         break;
                     case THRIFT:
-                        tclient = settings.getThriftClient();
-                        break;
                     case THRIFT_SMART:
-                        tclient = settings.getSmartThriftClient();
+                        tclient = settings.getThriftClient();
                         break;
                     default:
                         throw new IllegalStateException();
                 }
 
-                Work work;
-                while ( null != (work = workQueue.poll()) )
+                while (true)
                 {
+                    Operation op = operations.next();
+                    if (!op.ready(workManager, rateLimiter))
+                        break;
 
-                    if (rateLimiter != null)
-                        rateLimiter.acquire(work.count);
-
-                    for (int i = 0 ; i < work.count ; i++)
+                    try
                     {
-                        try
+                        switch (settings.mode.api)
                         {
-                            Operation op = createOperation(state, i + work.offset);
-                            switch (settings.mode.api)
-                            {
-                                case JAVA_DRIVER_NATIVE:
-                                    op.run(jclient);
-                                    break;
-                                case SIMPLE_NATIVE:
-                                    op.run(sclient);
-                                    break;
-                                case THRIFT:
-                                case THRIFT_SMART:
-                                default:
-                                    op.run(tclient);
-                            }
-                        } catch (Exception e)
-                        {
-                            if (output == null)
-                            {
-                                System.err.println(e.getMessage());
-                                success = false;
-                                System.exit(-1);
-                            }
-
-                            e.printStackTrace(output);
-                            success = false;
-                            workQueue.stop();
-                            state.metrics.cancel();
-                            return;
+                            case JAVA_DRIVER_NATIVE:
+                                op.run(jclient);
+                                break;
+                            case SIMPLE_NATIVE:
+                                op.run(sclient);
+                                break;
+                            case THRIFT:
+                            case THRIFT_SMART:
+                            default:
+                                op.run(tclient);
                         }
                     }
-                }
+                    catch (Exception e)
+                    {
+                        if (output == null)
+                        {
+                            System.err.println(e.getMessage());
+                            success = false;
+                            System.exit(-1);
+                        }
 
+                        e.printStackTrace(output);
+                        success = false;
+                        workManager.stop();
+                        metrics.cancel();
+                        return;
+                    }
+                }
             }
             finally
             {
                 done.countDown();
-                state.timer.close();
-            }
-
-        }
-
-    }
-
-    private interface WorkQueue
-    {
-        // null indicates consumer should terminate
-        Work poll();
-
-        // signal all consumers to terminate
-        void stop();
-    }
-
-    private static final class Work
-    {
-        // index of operations
-        final long offset;
-
-        // how many operations to perform
-        final int count;
-
-        public Work(long offset, int count)
-        {
-            this.offset = offset;
-            this.count = count;
-        }
-    }
-
-    private static final class FixedWorkQueue implements WorkQueue
-    {
-
-        final ArrayBlockingQueue<Work> work;
-        volatile boolean stop = false;
-
-        public FixedWorkQueue(ArrayBlockingQueue<Work> work)
-        {
-            this.work = work;
-        }
-
-        @Override
-        public Work poll()
-        {
-            if (stop)
-                return null;
-            return work.poll();
-        }
-
-        @Override
-        public void stop()
-        {
-            stop = true;
-        }
-
-        static FixedWorkQueue build(long operations)
-        {
-            // target splitting into around 50-500k items, with a minimum size of 20
-            if (operations > Integer.MAX_VALUE * (1L << 19))
-                throw new IllegalStateException("Cannot currently support more than approx 2^50 operations for one stress run. This is a LOT.");
-            int batchSize = (int) (operations / (1 << 19));
-            if (batchSize < 20)
-                batchSize = 20;
-            ArrayBlockingQueue<Work> work = new ArrayBlockingQueue<>(
-                    (int) ((operations / batchSize)
-                  + (operations % batchSize == 0 ? 0 : 1))
-            );
-            long offset = 0;
-            while (offset < operations)
-            {
-                work.add(new Work(offset, (int) Math.min(batchSize, operations - offset)));
-                offset += batchSize;
-            }
-            return new FixedWorkQueue(work);
-        }
-
-    }
-
-    private static final class ContinuousWorkQueue implements WorkQueue
-    {
-
-        final AtomicLong offset = new AtomicLong();
-        final int batchSize;
-        volatile boolean stop = false;
-
-        private ContinuousWorkQueue(int batchSize)
-        {
-            this.batchSize = batchSize;
-        }
-
-        @Override
-        public Work poll()
-        {
-            if (stop)
-                return null;
-            return new Work(nextOffset(), batchSize);
-        }
-
-        private long nextOffset()
-        {
-            final int inc = batchSize;
-            while (true)
-            {
-                final long cur = offset.get();
-                if (offset.compareAndSet(cur, cur + inc))
-                    return cur;
+                operations.closeTimers();
             }
         }
-
-        @Override
-        public void stop()
-        {
-            stop = true;
-        }
-
     }
-
-    private Operation createOperation(Operation.State state, long index)
-    {
-        return createOperation(state.type, state, index);
-    }
-    private Operation createOperation(Command type, Operation.State state, long index)
-    {
-        switch (type)
-        {
-            case READ:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftReader(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlReader(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-
-            case COUNTER_READ:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftCounterGetter(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlCounterGetter(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case WRITE:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftInserter(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlInserter(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case COUNTER_WRITE:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftCounterAdder(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlCounterAdder(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case RANGE_SLICE:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftRangeSlicer(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlRangeSlicer(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case INDEXED_RANGE_SLICE:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftIndexedRangeSlicer(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlIndexedRangeSlicer(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case READ_MULTI:
-                switch(state.settings.mode.style)
-                {
-                    case THRIFT:
-                        return new ThriftMultiGetter(state, index);
-                    case CQL:
-                    case CQL_PREPARED:
-                        return new CqlMultiGetter(state, index);
-                    default:
-                        throw new UnsupportedOperationException();
-                }
-
-            case MIXED:
-                Command subcommand = state.commandSelector.next();
-                return createOperation(subcommand, state.substate(subcommand), index);
-
-        }
-
-        throw new UnsupportedOperationException();
-    }
-
 }

@@ -153,7 +153,21 @@ public class RowIndexEntry implements IMeasurableMemory
 
         public int serializedSize(RowIndexEntry rie)
         {
-            return TypeSizes.NATIVE.sizeof(rie.position) + rie.promotedSize(type);
+            int size = TypeSizes.NATIVE.sizeof(rie.position) + TypeSizes.NATIVE.sizeof(rie.promotedSize(type));
+
+            if (rie.isIndexed())
+            {
+                List<IndexHelper.IndexInfo> index = rie.columnsIndex();
+
+                size += DeletionTime.serializer.serializedSize(rie.deletionTime(), TypeSizes.NATIVE);
+                size += TypeSizes.NATIVE.sizeof(index.size());
+
+                ISerializer<IndexHelper.IndexInfo> idxSerializer = type.indexSerializer();
+                for (IndexHelper.IndexInfo info : index)
+                    size += idxSerializer.serializedSize(info, TypeSizes.NATIVE);
+            }
+
+            return size;
         }
     }
 
@@ -207,7 +221,7 @@ public class RowIndexEntry implements IMeasurableMemory
         {
             long entrySize = 0;
             for (IndexHelper.IndexInfo idx : columnsIndex)
-                entrySize += idx.excessHeapSize();
+                entrySize += idx.unsharedHeapSize();
 
             return BASE_SIZE
                    + entrySize

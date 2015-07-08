@@ -24,12 +24,11 @@ import java.util.List;
 import java.util.Random;
 
 import com.google.common.annotations.VisibleForTesting;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.compaction.AbstractCompactedRow;
@@ -37,6 +36,7 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.repair.messages.ValidationComplete;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MerkleTree;
+import org.apache.cassandra.utils.MerkleTree.RowHash;
 
 /**
  * Handles the building of a merkle tree for a column family.
@@ -52,41 +52,32 @@ public class Validator implements Runnable
 
     public final RepairJobDesc desc;
     public final InetAddress initiator;
-    public final MerkleTree tree;
     public final int gcBefore;
 
     // null when all rows with the min token have been consumed
-    private transient long validated;
-    private transient MerkleTree.TreeRange range;
-    private transient MerkleTree.TreeRangeIterator ranges;
-    private transient DecoratedKey lastKey;
+    private long validated;
+    private MerkleTree tree;
+    // current range being updated
+    private MerkleTree.TreeRange range;
+    // iterator for iterating sub ranges (MT's leaves)
+    private MerkleTree.TreeRangeIterator ranges;
+    // last key seen
+    private DecoratedKey lastKey;
 
-    /**
-     * Create Validator with default size of initial Merkle Tree.
-     */
     public Validator(RepairJobDesc desc, InetAddress initiator, int gcBefore)
-    {
-        this(desc,
-             initiator,
-             // TODO: memory usage (maxsize) should either be tunable per
-             // CF, globally, or as shared for all CFs in a cluster
-             new MerkleTree(DatabaseDescriptor.getPartitioner(), desc.range, MerkleTree.RECOMMENDED_DEPTH, (int)Math.pow(2, 15)),
-             gcBefore);
-    }
-
-    public Validator(RepairJobDesc desc, InetAddress initiator, MerkleTree tree, int gcBefore)
     {
         this.desc = desc;
         this.initiator = initiator;
-        this.tree = tree;
         this.gcBefore = gcBefore;
         validated = 0;
         range = null;
         ranges = null;
     }
 
-    public void prepare(ColumnFamilyStore cfs)
+    public void prepare(ColumnFamilyStore cfs, MerkleTree tree)
     {
+        this.tree = tree;
+
         if (!tree.partitioner().preservesOrder())
         {
             // You can't beat an even tree distribution for md5
@@ -148,7 +139,11 @@ public class Validator implements Runnable
         }
 
         // case 3 must be true: mix in the hashed row
-        range.addHash(rowHash(row));
+        RowHash rowHash = rowHash(row);
+        if (rowHash != null)
+        {
+            range.addHash(rowHash);
+        }
     }
 
     static class CountingDigest extends MessageDigest
@@ -196,7 +191,15 @@ public class Validator implements Runnable
         // MerkleTree uses XOR internally, so we want lots of output bits here
         CountingDigest digest = new CountingDigest(FBUtilities.newMessageDigest("SHA-256"));
         row.update(digest);
-        return new MerkleTree.RowHash(row.key.getToken(), digest.digest(), digest.count);
+        // only return new hash for merkle tree in case digest was updated - see CASSANDRA-8979
+        if (digest.count > 0)
+        {
+            return new MerkleTree.RowHash(row.key.getToken(), digest.digest(), digest.count);
+        }
+        else
+        {
+            return null;
+        }
     }
 
     /**

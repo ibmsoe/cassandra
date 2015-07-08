@@ -17,7 +17,10 @@
  */
 package org.apache.cassandra.transport.messages;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.netty.buffer.ByteBuf;
+import io.netty.handler.codec.CodecException;
+import com.google.common.base.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -204,8 +207,37 @@ public class ErrorMessage extends Message.Response
 
     public static ErrorMessage fromException(Throwable e)
     {
+        return fromException(e, null);
+    }
+
+    /**
+     * @param e the exception
+     * @param unexpectedExceptionHandler a callback for handling unexpected exceptions. If null, or if this
+     *                                   returns false, the error is logged at ERROR level via sl4fj
+     */
+    public static ErrorMessage fromException(Throwable e, Predicate<Throwable> unexpectedExceptionHandler)
+    {
         int streamId = 0;
-        if (e instanceof WrappedException)
+
+        // Netty will wrap exceptions during decoding in a CodecException. If the cause was one of our ProtocolExceptions
+        // or some other internal exception, extract that and use it.
+        if (e instanceof CodecException)
+        {
+            Throwable cause = e.getCause();
+            if (cause != null)
+            {
+                if (cause instanceof WrappedException)
+                {
+                    streamId = ((WrappedException) cause).streamId;
+                    e = cause.getCause();
+                }
+                else if (cause instanceof TransportException)
+                {
+                    e = cause;
+                }
+            }
+        }
+        else if (e instanceof WrappedException)
         {
             streamId = ((WrappedException)e).streamId;
             e = e.getCause();
@@ -215,7 +247,9 @@ public class ErrorMessage extends Message.Response
             return new ErrorMessage((TransportException)e, streamId);
 
         // Unexpected exception
-        logger.error("Unexpected exception during request", e);
+        if (unexpectedExceptionHandler == null || !unexpectedExceptionHandler.apply(e))
+            logger.error("Unexpected exception during request", e);
+
         return new ErrorMessage(new ServerError(e), streamId);
     }
 
@@ -230,7 +264,7 @@ public class ErrorMessage extends Message.Response
         return new WrappedException(t, streamId);
     }
 
-    private static class WrappedException extends RuntimeException
+    public static class WrappedException extends RuntimeException
     {
         private final int streamId;
 
@@ -238,6 +272,12 @@ public class ErrorMessage extends Message.Response
         {
             super(cause);
             this.streamId = streamId;
+        }
+
+        @VisibleForTesting
+        public int getStreamId()
+        {
+            return this.streamId;
         }
     }
 

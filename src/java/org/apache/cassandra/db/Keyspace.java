@@ -29,20 +29,17 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.locks.Lock;
 
 import com.google.common.base.Function;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
-import com.google.common.util.concurrent.Striped;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.KSMetaData;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.ReplayPosition;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.QueryFilter;
 import org.apache.cassandra.db.index.SecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndexManager;
@@ -52,6 +49,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.pager.QueryPagers;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.metrics.KeyspaceMetrics;
 
 /**
  * It represents a Keyspace.
@@ -63,22 +61,23 @@ public class Keyspace
 
     private static final Logger logger = LoggerFactory.getLogger(Keyspace.class);
 
-    private static final Striped<Lock> counterLocks = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentCounterWriters() * 1024);
+    public final KeyspaceMetrics metric;
 
     // It is possible to call Keyspace.open without a running daemon, so it makes sense to ensure
     // proper directories here as well as in CassandraDaemon.
     static
     {
-        if (!StorageService.instance.isClientMode())
+        if (!(Config.isClientMode() || StorageService.instance.isClientMode()))
             DatabaseDescriptor.createAllDirectories();
     }
 
-    public final KSMetaData metadata;
     public final OpOrder writeOrder = new OpOrder();
 
     /* ColumnFamilyStore per column family */
     private final ConcurrentMap<UUID, ColumnFamilyStore> columnFamilyStores = new ConcurrentHashMap<UUID, ColumnFamilyStore>();
+    private volatile KSMetaData metadata;
     private volatile AbstractReplicationStrategy replicationStrategy;
+
     public static final Function<String,Keyspace> keyspaceTransformer = new Function<String, Keyspace>()
     {
         public Keyspace apply(String keyspaceName)
@@ -145,6 +144,7 @@ public class Keyspace
             {
                 for (ColumnFamilyStore cfs : t.getColumnFamilyStores())
                     t.unloadCf(cfs);
+                t.metric.release();
             }
             return t;
         }
@@ -185,15 +185,6 @@ public class Keyspace
         if (cfs == null)
             throw new IllegalArgumentException("Unknown CF " + id);
         return cfs;
-    }
-
-    /**
-     * @param keys the keys to grab the locks for
-     * @return the striped lock instances
-     */
-    public static Iterable<Lock> counterLocksFor(Iterable<Object> keys)
-    {
-        return counterLocks.bulkGet(keys);
     }
 
     /**
@@ -281,6 +272,7 @@ public class Keyspace
         assert metadata != null : "Unknown keyspace " + keyspaceName;
         createReplicationStrategy(metadata);
 
+        this.metric = new KeyspaceMetrics(this);
         for (CFMetaData cfm : new ArrayList<CFMetaData>(metadata.cfMetaData().values()))
         {
             logger.debug("Initializing {}.{}", getName(), cfm.cfName);
@@ -288,13 +280,24 @@ public class Keyspace
         }
     }
 
-    public void createReplicationStrategy(KSMetaData ksm)
+    private void createReplicationStrategy(KSMetaData ksm)
     {
         replicationStrategy = AbstractReplicationStrategy.createReplicationStrategy(ksm.name,
                                                                                     ksm.strategyClass,
                                                                                     StorageService.instance.getTokenMetadata(),
                                                                                     DatabaseDescriptor.getEndpointSnitch(),
                                                                                     ksm.strategyOptions);
+    }
+
+    public void setMetadata(KSMetaData ksm)
+    {
+        this.metadata = ksm;
+        createReplicationStrategy(ksm);
+    }
+
+    public KSMetaData getMetadata()
+    {
+        return metadata;
     }
 
     // best invoked on the compaction mananger.
@@ -304,6 +307,12 @@ public class Keyspace
         ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
         if (cfs == null)
             return;
+
+        cfs.getCompactionStrategy().shutdown();
+        CompactionManager.instance.interruptCompactionForCFs(cfs.concatWithIndexes(), true);
+        // wait for any outstanding reads/writes that might affect the CFS
+        cfs.keyspace.writeOrder.awaitNewBarrier();
+        cfs.readOrdering.awaitNewBarrier();
 
         unloadCf(cfs);
     }
@@ -367,17 +376,11 @@ public class Keyspace
         try (OpOrder.Group opGroup = writeOrder.start())
         {
             // write the mutation to the commitlog and memtables
-            final ReplayPosition replayPosition;
+            ReplayPosition replayPosition = null;
             if (writeCommitLog)
             {
                 Tracing.trace("Appending to commitlog");
                 replayPosition = CommitLog.instance.add(mutation);
-            }
-            else
-            {
-                // we don't need the replayposition, but grab one anyway so that it stays stack allocated.
-                // (the JVM will not stack allocate if the object may be null.)
-                replayPosition = CommitLog.instance.getContext();
             }
 
             DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
@@ -391,7 +394,9 @@ public class Keyspace
                 }
 
                 Tracing.trace("Adding to {} memtable", cf.metadata().cfName);
-                SecondaryIndexManager.Updater updater = updateIndexes ? cfs.indexManager.updaterFor(key, opGroup) : SecondaryIndexManager.nullUpdater;
+                SecondaryIndexManager.Updater updater = updateIndexes
+                                                      ? cfs.indexManager.updaterFor(key, cf, opGroup)
+                                                      : SecondaryIndexManager.nullUpdater;
                 cfs.apply(key, cf, updater, opGroup, replayPosition);
             }
         }

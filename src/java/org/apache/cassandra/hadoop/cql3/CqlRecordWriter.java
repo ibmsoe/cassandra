@@ -23,11 +23,8 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.apache.cassandra.hadoop.HadoopCompat;
-import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.LongType;
@@ -36,13 +33,16 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.hadoop.AbstractColumnFamilyOutputFormat;
 import org.apache.cassandra.hadoop.AbstractColumnFamilyRecordWriter;
 import org.apache.cassandra.hadoop.ConfigHelper;
+import org.apache.cassandra.hadoop.HadoopCompat;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.util.Progressable;
 import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransport;
 
@@ -103,17 +103,26 @@ class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String, ByteB
         try
         {
             Cassandra.Client client = ConfigHelper.getClientFromOutputAddressList(conf);
-            retrievePartitionKeyValidator(client);
-            String cqlQuery = CqlConfigHelper.getOutputCql(conf).trim();
-            if (cqlQuery.toLowerCase().startsWith("insert"))
-                throw new UnsupportedOperationException("INSERT with CqlRecordWriter is not supported, please use UPDATE/DELETE statement");
-            cql = appendKeyWhereClauses(cqlQuery);
-
             if (client != null)
             {
+                client.set_keyspace(ConfigHelper.getOutputKeyspace(conf));
+                String user = ConfigHelper.getOutputKeyspaceUserName(conf);
+                String password = ConfigHelper.getOutputKeyspacePassword(conf);
+                if ((user != null) && (password != null))
+                    AbstractColumnFamilyOutputFormat.login(user, password, client);
+                retrievePartitionKeyValidator(client);
+                String cqlQuery = CqlConfigHelper.getOutputCql(conf).trim();
+                if (cqlQuery.toLowerCase().startsWith("insert"))
+                    throw new UnsupportedOperationException("INSERT with CqlRecordWriter is not supported, please use UPDATE/DELETE statement");
+                cql = appendKeyWhereClauses(cqlQuery);
+
                 TTransport transport = client.getOutputProtocol().getTransport();
                 if (transport.isOpen())
                     transport.close();
+            }
+            else
+            {
+                throw new IllegalArgumentException("Invalid configuration specified " + conf);
             }
         }
         catch (Exception e)
@@ -274,6 +283,9 @@ class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String, ByteB
                     }
                 }
             }
+
+            // close all our connections once we are done.
+            closeInternal();
         }
 
         /** get prepared statement id from cache, otherwise prepare it from Cassandra server*/

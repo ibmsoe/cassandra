@@ -33,6 +33,7 @@ import org.apache.cassandra.exceptions.PreparedQueryNotFoundException;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.*;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -102,11 +103,11 @@ public class ExecuteMessage extends Message.Request
         {
             QueryHandler handler = state.getClientState().getCQLQueryHandler();
             ParsedStatement.Prepared prepared = handler.getPrepared(statementId);
+            if (prepared == null)
+                throw new PreparedQueryNotFoundException(statementId);
+
             options.prepare(prepared.boundNames);
             CQLStatement statement = prepared.statement;
-
-            if (statement == null)
-                throw new PreparedQueryNotFoundException(statementId);
 
             if (options.getPageSize() == 0)
                 throw new ProtocolException("The page size cannot be 0");
@@ -141,6 +142,7 @@ public class ExecuteMessage extends Message.Request
         }
         catch (Exception e)
         {
+            JVMStabilityInspector.inspectThrowable(e);
             return ErrorMessage.fromException(e);
         }
         finally

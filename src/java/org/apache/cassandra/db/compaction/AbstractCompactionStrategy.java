@@ -19,9 +19,9 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.*;
 
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.base.Predicate;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.RateLimiter;
 import org.slf4j.Logger;
@@ -33,7 +33,9 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * Pluggable compaction strategy determines how SSTables get merged.
@@ -64,6 +66,7 @@ public abstract class AbstractCompactionStrategy
     protected float tombstoneThreshold;
     protected long tombstoneCompactionInterval;
     protected boolean uncheckedTombstoneCompaction;
+    protected boolean disableTombstoneCompactions = false;
 
     /**
      * pause/resume/getNextBackgroundTask must synchronize.  This guarantees that after pause completes,
@@ -264,16 +267,84 @@ public abstract class AbstractCompactionStrategy
      * allow for a more memory efficient solution if we know the sstable don't overlap (see
      * LeveledCompactionStrategy for instance).
      */
-    public List<ICompactionScanner> getScanners(Collection<SSTableReader> sstables, Range<Token> range)
+    public ScannerList getScanners(Collection<SSTableReader> sstables, Range<Token> range)
     {
         RateLimiter limiter = CompactionManager.instance.getRateLimiter();
-        ArrayList<ICompactionScanner> scanners = new ArrayList<ICompactionScanner>();
-        for (SSTableReader sstable : sstables)
-            scanners.add(sstable.getScanner(range, limiter));
-        return scanners;
+        ArrayList<ISSTableScanner> scanners = new ArrayList<ISSTableScanner>();
+        try
+        {
+            for (SSTableReader sstable : sstables)
+                scanners.add(sstable.getScanner(range, limiter));
+        }
+        catch (Throwable t)
+        {
+            try
+            {
+                new ScannerList(scanners).close();
+            }
+            catch (Throwable t2)
+            {
+                t.addSuppressed(t2);
+            }
+            throw t;
+        }
+        return new ScannerList(scanners);
     }
 
-    public List<ICompactionScanner> getScanners(Collection<SSTableReader> toCompact)
+    public boolean shouldDefragment()
+    {
+        return false;
+    }
+
+    public String getName()
+    {
+        return getClass().getSimpleName();
+    }
+
+    public synchronized void replaceSSTables(Collection<SSTableReader> removed, Collection<SSTableReader> added)
+    {
+        for (SSTableReader remove : removed)
+            removeSSTable(remove);
+        for (SSTableReader add : added)
+            addSSTable(add);
+    }
+
+    public abstract void addSSTable(SSTableReader added);
+
+    public abstract void removeSSTable(SSTableReader sstable);
+
+    public static class ScannerList implements AutoCloseable
+    {
+        public final List<ISSTableScanner> scanners;
+        public ScannerList(List<ISSTableScanner> scanners)
+        {
+            this.scanners = scanners;
+        }
+
+        public void close()
+        {
+            Throwable t = null;
+            for (ISSTableScanner scanner : scanners)
+            {
+                try
+                {
+                    scanner.close();
+                }
+                catch (Throwable t2)
+                {
+                    JVMStabilityInspector.inspectThrowable(t2);
+                    if (t == null)
+                        t = t2;
+                    else
+                        t.addSuppressed(t2);
+                }
+            }
+            if (t != null)
+                throw Throwables.propagate(t);
+        }
+    }
+
+    public ScannerList getScanners(Collection<SSTableReader> toCompact)
     {
         return getScanners(toCompact, null);
     }
@@ -288,6 +359,8 @@ public abstract class AbstractCompactionStrategy
      */
     protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
     {
+        if (disableTombstoneCompactions)
+            return false;
         // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
         // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
         // elapsed since SSTable created.
@@ -302,7 +375,7 @@ public abstract class AbstractCompactionStrategy
         if (uncheckedTombstoneCompaction)
             return true;
 
-        Set<SSTableReader> overlaps = cfs.getOverlappingSSTables(Collections.singleton(sstable));
+        Collection<SSTableReader> overlaps = cfs.getOverlappingSSTables(Collections.singleton(sstable));
         if (overlaps.isEmpty())
         {
             // there is no overlap, tombstones are safely droppable

@@ -18,13 +18,18 @@
 package org.apache.cassandra.stress.util;
 
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import javax.net.ssl.SSLContext;
 
 import com.datastax.driver.core.*;
-import org.apache.cassandra.config.EncryptionOptions;
-import org.apache.cassandra.security.SSLFactory;
+import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
+import com.datastax.driver.core.policies.WhiteListPolicy;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.stress.settings.StressSettings;
 
 public class JavaDriverClient
 {
@@ -36,25 +41,50 @@ public class JavaDriverClient
 
     public final String host;
     public final int port;
+    public final String username;
+    public final String password;
+    public final AuthProvider authProvider;
+
     private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
     private Cluster cluster;
     private Session session;
+    private final WhiteListPolicy whitelist;
 
-    public JavaDriverClient(String host, int port)
+    private static final ConcurrentMap<String, PreparedStatement> stmts = new ConcurrentHashMap<>();
+
+    public JavaDriverClient(StressSettings settings, String host, int port)
     {
-        this(host, port, new EncryptionOptions.ClientEncryptionOptions());
+        this(settings, host, port, new EncryptionOptions.ClientEncryptionOptions());
     }
 
-    public JavaDriverClient(String host, int port, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
+    public JavaDriverClient(StressSettings settings, String host, int port, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
     {
         this.host = host;
         this.port = port;
+        this.username = settings.mode.username;
+        this.password = settings.mode.password;
+        this.authProvider = settings.mode.authProvider;
         this.encryptionOptions = encryptionOptions;
+        if (settings.node.isWhiteList)
+            whitelist = new WhiteListPolicy(new DCAwareRoundRobinPolicy(), settings.node.resolveAll(settings.port.nativePort));
+        else
+            whitelist = null;
     }
 
     public PreparedStatement prepare(String query)
     {
-        return getSession().prepare(query);
+        PreparedStatement stmt = stmts.get(query);
+        if (stmt != null)
+            return stmt;
+        synchronized (stmts)
+        {
+            stmt = stmts.get(query);
+            if (stmt != null)
+                return stmt;
+            stmt = getSession().prepare(query);
+            stmts.put(query, stmt);
+        }
+        return stmt;
     }
 
     public void connect(ProtocolOptions.Compression compression) throws Exception
@@ -63,6 +93,8 @@ public class JavaDriverClient
                                                 .addContactPoint(host)
                                                 .withPort(port)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
+        if (whitelist != null)
+            clusterBuilder.withLoadBalancingPolicy(whitelist);
         clusterBuilder.withCompression(compression);
         if (encryptionOptions.enabled)
         {
@@ -71,6 +103,16 @@ public class JavaDriverClient
             SSLOptions sslOptions = new SSLOptions(sslContext, encryptionOptions.cipher_suites);
             clusterBuilder.withSSL(sslOptions);
         }
+
+        if (authProvider != null)
+        {
+            clusterBuilder.withAuthProvider(authProvider);
+        }
+        else if (username != null)
+        {
+            clusterBuilder.withCredentials(username, password);
+        }
+
         cluster = clusterBuilder.build();
         Metadata metadata = cluster.getMetadata();
         System.out.printf("Connected to cluster: %s%n",
@@ -116,7 +158,7 @@ public class JavaDriverClient
      * @param cl
      * @return
      */
-    ConsistencyLevel from(org.apache.cassandra.db.ConsistencyLevel cl)
+    public static ConsistencyLevel from(org.apache.cassandra.db.ConsistencyLevel cl)
     {
         switch (cl)
         {
@@ -136,6 +178,8 @@ public class JavaDriverClient
                 return com.datastax.driver.core.ConsistencyLevel.LOCAL_QUORUM;
             case EACH_QUORUM:
                 return com.datastax.driver.core.ConsistencyLevel.EACH_QUORUM;
+            case LOCAL_ONE:
+                return com.datastax.driver.core.ConsistencyLevel.LOCAL_ONE;
         }
         throw new AssertionError();
     }

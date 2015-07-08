@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestTimeoutException;
@@ -47,6 +48,25 @@ public class ThriftConversion
             case SERIAL: return org.apache.cassandra.db.ConsistencyLevel.SERIAL;
             case LOCAL_SERIAL: return org.apache.cassandra.db.ConsistencyLevel.LOCAL_SERIAL;
             case LOCAL_ONE: return org.apache.cassandra.db.ConsistencyLevel.LOCAL_ONE;
+        }
+        throw new AssertionError();
+    }
+
+    public static ConsistencyLevel toThrift(org.apache.cassandra.db.ConsistencyLevel cl)
+    {
+        switch (cl)
+        {
+            case ANY: return ConsistencyLevel.ANY;
+            case ONE: return ConsistencyLevel.ONE;
+            case TWO: return ConsistencyLevel.TWO;
+            case THREE: return ConsistencyLevel.THREE;
+            case QUORUM: return ConsistencyLevel.QUORUM;
+            case ALL: return ConsistencyLevel.ALL;
+            case LOCAL_QUORUM: return ConsistencyLevel.LOCAL_QUORUM;
+            case EACH_QUORUM: return ConsistencyLevel.EACH_QUORUM;
+            case SERIAL: return ConsistencyLevel.SERIAL;
+            case LOCAL_SERIAL: return ConsistencyLevel.LOCAL_SERIAL;
+            case LOCAL_ONE: return ConsistencyLevel.LOCAL_ONE;
         }
         throw new AssertionError();
     }
@@ -105,7 +125,7 @@ public class ThriftConversion
         for (IndexExpression expr : exprs)
         {
             converted.add(new org.apache.cassandra.db.IndexExpression(expr.column_name,
-                                                                      org.apache.cassandra.db.IndexExpression.Operator.findByOrdinal(expr.op.getValue()),
+                                                                      Operator.valueOf(expr.op.name()),
                                                                       expr.value));
         }
         return converted;

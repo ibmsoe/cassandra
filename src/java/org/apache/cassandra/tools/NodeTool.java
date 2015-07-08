@@ -17,43 +17,6 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.*;
-import java.lang.management.MemoryUsage;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.text.DecimalFormat;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.Map.Entry;
-import java.util.concurrent.ExecutionException;
-
-import javax.management.openmbean.TabularData;
-
-import com.google.common.base.Joiner;
-import com.google.common.base.Throwables;
-import com.google.common.collect.ArrayListMultimap;
-import com.google.common.collect.LinkedHashMultimap;
-import com.google.common.collect.Maps;
-import com.yammer.metrics.reporting.JmxReporter;
-
-import io.airlift.command.*;
-
-import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutorMBean;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.ColumnFamilyStoreMBean;
-import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.compaction.CompactionManagerMBean;
-import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
-import org.apache.cassandra.net.MessagingServiceMBean;
-import org.apache.cassandra.service.CacheServiceMBean;
-import org.apache.cassandra.streaming.ProgressInfo;
-import org.apache.cassandra.streaming.SessionInfo;
-import org.apache.cassandra.streaming.StreamState;
-import org.apache.cassandra.utils.EstimatedHistogram;
-import org.apache.cassandra.utils.FBUtilities;
-
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Throwables.getStackTraceAsString;
@@ -62,7 +25,82 @@ import static com.google.common.collect.Lists.newArrayList;
 import static java.lang.Integer.parseInt;
 import static java.lang.String.format;
 import static org.apache.commons.lang3.ArrayUtils.EMPTY_STRING_ARRAY;
-import static org.apache.commons.lang3.StringUtils.*;
+import static org.apache.commons.lang3.StringUtils.EMPTY;
+import static org.apache.commons.lang3.StringUtils.isEmpty;
+import static org.apache.commons.lang3.StringUtils.isNotEmpty;
+import static org.apache.commons.lang3.StringUtils.join;
+import io.airlift.command.Arguments;
+import io.airlift.command.Cli;
+import io.airlift.command.Command;
+import io.airlift.command.Help;
+import io.airlift.command.Option;
+import io.airlift.command.OptionType;
+import io.airlift.command.ParseArgumentsMissingException;
+import io.airlift.command.ParseArgumentsUnexpectedException;
+import io.airlift.command.ParseCommandMissingException;
+import io.airlift.command.ParseCommandUnrecognizedException;
+import io.airlift.command.ParseOptionConversionException;
+import io.airlift.command.ParseOptionMissingException;
+import io.airlift.command.ParseOptionMissingValueException;
+
+import java.io.Console;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOError;
+import java.io.IOException;
+import java.lang.management.MemoryUsage;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.text.DecimalFormat;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Scanner;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+
+import javax.management.InstanceNotFoundException;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+import javax.management.openmbean.TabularDataSupport;
+
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutorMBean;
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionManagerMBean;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
+import org.apache.cassandra.metrics.ColumnFamilyMetrics.Sampler;
+import org.apache.cassandra.net.MessagingServiceMBean;
+import org.apache.cassandra.repair.RepairParallelism;
+import org.apache.cassandra.service.CacheServiceMBean;
+import org.apache.cassandra.service.StorageProxyMBean;
+import org.apache.cassandra.streaming.ProgressInfo;
+import org.apache.cassandra.streaming.SessionInfo;
+import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.commons.lang3.ArrayUtils;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.LinkedHashMultimap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Ordering;
+import com.yammer.metrics.reporting.JmxReporter;
 
 public class NodeTool
 {
@@ -95,6 +133,7 @@ public class NodeTool
                 DisableGossip.class,
                 EnableHandoff.class,
                 EnableThrift.class,
+                GcStats.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
                 GetStreamThroughput.class,
@@ -115,6 +154,7 @@ public class NodeTool
                 RemoveNode.class,
                 Repair.class,
                 SetCacheCapacity.class,
+                SetHintedHandoffThrottleInKB.class,
                 SetCompactionThreshold.class,
                 SetCompactionThroughput.class,
                 SetStreamThroughput.class,
@@ -123,7 +163,10 @@ public class NodeTool
                 ListSnapshots.class,
                 Status.class,
                 StatusBinary.class,
+                StatusGossip.class,
                 StatusThrift.class,
+                StatusBackup.class,
+                StatusHandoff.class,
                 Stop.class,
                 StopDaemon.class,
                 Version.class,
@@ -140,7 +183,7 @@ public class NodeTool
                 Drain.class,
                 TruncateHints.class,
                 TpStats.class,
-                TakeToken.class,
+                TopPartitions.class,
                 SetLoggingLevel.class,
                 GetLoggingLevels.class
         );
@@ -192,7 +235,7 @@ public class NodeTool
             SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss,SSS");
             writer.append(sdf.format(new Date())).append(": ").append(cmdLine).append(System.lineSeparator());
         }
-        catch (IOException ioe)
+        catch (IOException | IOError ioe)
         {
             //quietly ignore any errors about not being able to write out history
         }
@@ -243,7 +286,9 @@ public class NodeTool
             try (NodeProbe probe = connect())
             {
                 execute(probe);
-            } 
+                if (probe.isFailed())
+                    throw new RuntimeException("nodetool failed, check server logs");
+            }
             catch (IOException e)
             {
                 throw new RuntimeException("Error while closing JMX connection", e);
@@ -346,63 +391,73 @@ public class NodeTool
         {
             boolean gossipInitialized = probe.isInitialized();
 
-            System.out.printf("%-17s: %s%n", "ID", probe.getLocalHostId());
-            System.out.printf("%-17s: %s%n", "Gossip active", gossipInitialized);
-            System.out.printf("%-17s: %s%n", "Thrift active", probe.isThriftServerRunning());
-            System.out.printf("%-17s: %s%n", "Native Transport active", probe.isNativeTransportRunning());
-            System.out.printf("%-17s: %s%n", "Load", probe.getLoadString());
+            System.out.printf("%-23s: %s%n", "ID", probe.getLocalHostId());
+            System.out.printf("%-23s: %s%n", "Gossip active", gossipInitialized);
+            System.out.printf("%-23s: %s%n", "Thrift active", probe.isThriftServerRunning());
+            System.out.printf("%-23s: %s%n", "Native Transport active", probe.isNativeTransportRunning());
+            System.out.printf("%-23s: %s%n", "Load", probe.getLoadString());
             if (gossipInitialized)
-                System.out.printf("%-17s: %s%n", "Generation No", probe.getCurrentGenerationNumber());
+                System.out.printf("%-23s: %s%n", "Generation No", probe.getCurrentGenerationNumber());
             else
-                System.out.printf("%-17s: %s%n", "Generation No", 0);
+                System.out.printf("%-23s: %s%n", "Generation No", 0);
 
             // Uptime
             long secondsUp = probe.getUptime() / 1000;
-            System.out.printf("%-17s: %d%n", "Uptime (seconds)", secondsUp);
+            System.out.printf("%-23s: %d%n", "Uptime (seconds)", secondsUp);
 
             // Memory usage
             MemoryUsage heapUsage = probe.getHeapMemoryUsage();
             double memUsed = (double) heapUsage.getUsed() / (1024 * 1024);
             double memMax = (double) heapUsage.getMax() / (1024 * 1024);
-            System.out.printf("%-17s: %.2f / %.2f%n", "Heap Memory (MB)", memUsed, memMax);
+            System.out.printf("%-23s: %.2f / %.2f%n", "Heap Memory (MB)", memUsed, memMax);
+            try
+            {
+                System.out.printf("%-23s: %.2f%n", "Off Heap Memory (MB)", getOffHeapMemoryUsed(probe));
+            }
+            catch (RuntimeException e)
+            {
+                // offheap-metrics introduced in 2.1.3 - older versions do not have the appropriate mbeans
+                if (!(e.getCause() instanceof InstanceNotFoundException))
+                    throw e;
+            }
 
             // Data Center/Rack
-            System.out.printf("%-17s: %s%n", "Data Center", probe.getDataCenter());
-            System.out.printf("%-17s: %s%n", "Rack", probe.getRack());
+            System.out.printf("%-23s: %s%n", "Data Center", probe.getDataCenter());
+            System.out.printf("%-23s: %s%n", "Rack", probe.getRack());
 
             // Exceptions
-            System.out.printf("%-17s: %s%n", "Exceptions", probe.getStorageMetric("Exceptions"));
+            System.out.printf("%-23s: %s%n", "Exceptions", probe.getStorageMetric("Exceptions"));
 
             CacheServiceMBean cacheService = probe.getCacheServiceMBean();
 
             // Key Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-            System.out.printf("%-17s: entries %d, size %d (bytes), capacity %d (bytes), %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+            System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                     "Key Cache",
                     probe.getCacheMetric("KeyCache", "Entries"),
-                    probe.getCacheMetric("KeyCache", "Size"),
-                    probe.getCacheMetric("KeyCache", "Capacity"),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("KeyCache", "Size")),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("KeyCache", "Capacity")),
                     probe.getCacheMetric("KeyCache", "Hits"),
                     probe.getCacheMetric("KeyCache", "Requests"),
                     probe.getCacheMetric("KeyCache", "HitRate"),
                     cacheService.getKeyCacheSavePeriodInSeconds());
 
             // Row Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-            System.out.printf("%-17s: entries %d, size %d (bytes), capacity %d (bytes), %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+            System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                     "Row Cache",
                     probe.getCacheMetric("RowCache", "Entries"),
-                    probe.getCacheMetric("RowCache", "Size"),
-                    probe.getCacheMetric("RowCache", "Capacity"),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("RowCache", "Size")),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("RowCache", "Capacity")),
                     probe.getCacheMetric("RowCache", "Hits"),
                     probe.getCacheMetric("RowCache", "Requests"),
                     probe.getCacheMetric("RowCache", "HitRate"),
                     cacheService.getRowCacheSavePeriodInSeconds());
 
             // Counter Cache: Hits, Requests, RecentHitRate, SavePeriodInSeconds
-            System.out.printf("%-17s: entries %d, size %d (bytes), capacity %d (bytes), %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
+            System.out.printf("%-23s: entries %d, size %s, capacity %s, %d hits, %d requests, %.3f recent hit rate, %d save period in seconds%n",
                     "Counter Cache",
                     probe.getCacheMetric("CounterCache", "Entries"),
-                    probe.getCacheMetric("CounterCache", "Size"),
-                    probe.getCacheMetric("CounterCache", "Capacity"),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("CounterCache", "Size")),
+                    FileUtils.stringifyFileSize((long) probe.getCacheMetric("CounterCache", "Capacity")),
                     probe.getCacheMetric("CounterCache", "Hits"),
                     probe.getCacheMetric("CounterCache", "Requests"),
                     probe.getCacheMetric("CounterCache", "HitRate"),
@@ -412,9 +467,34 @@ public class NodeTool
             List<String> tokens = probe.getTokens();
             if (tokens.size() == 1 || this.tokens)
                 for (String token : tokens)
-                    System.out.printf("%-17s: %s%n", "Token", token);
+                    System.out.printf("%-23s: %s%n", "Token", token);
             else
-                System.out.printf("%-17s: (invoke with -T/--tokens to see all %d tokens)%n", "Token", tokens.size());
+                System.out.printf("%-23s: (invoke with -T/--tokens to see all %d tokens)%n", "Token", tokens.size());
+        }
+
+        /**
+         * Returns the total off heap memory used in MB.
+         * @return the total off heap memory used in MB.
+         */
+        private static double getOffHeapMemoryUsed(NodeProbe probe)
+        {
+            long offHeapMemUsedInBytes = 0;
+            // get a list of column family stores
+            Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> cfamilies = probe.getColumnFamilyStoreMBeanProxies();
+
+            while (cfamilies.hasNext())
+            {
+                Entry<String, ColumnFamilyStoreMBean> entry = cfamilies.next();
+                String keyspaceName = entry.getKey();
+                String cfName = entry.getValue().getColumnFamilyName();
+
+                offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableOffHeapSize");
+                offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterOffHeapMemoryUsed");
+                offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "IndexSummaryOffHeapMemoryUsed");
+                offHeapMemUsedInBytes += (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "CompressionMetadataOffHeapMemoryUsed");
+            }
+
+            return offHeapMemUsedInBytes / (1024d * 1024);
         }
     }
 
@@ -432,8 +512,12 @@ public class NodeTool
         {
             Map<String, String> tokensToEndpoints = probe.getTokenToEndpointMap();
             LinkedHashMultimap<String, String> endpointsToTokens = LinkedHashMultimap.create();
+            boolean haveVnodes = false;
             for (Map.Entry<String, String> entry : tokensToEndpoints.entrySet())
+            {
+                haveVnodes |= endpointsToTokens.containsKey(entry.getValue());
                 endpointsToTokens.put(entry.getValue(), entry.getKey());
+            }
 
             int maxAddressLength = Collections.max(endpointsToTokens.keys(), new Comparator<String>()
             {
@@ -447,31 +531,44 @@ public class NodeTool
             String formatPlaceholder = "%%-%ds  %%-12s%%-7s%%-8s%%-16s%%-20s%%-44s%%n";
             String format = format(formatPlaceholder, maxAddressLength);
 
+            StringBuffer errors = new StringBuffer();
+            boolean showEffectiveOwnership = true;
             // Calculate per-token ownership of the ring
             Map<InetAddress, Float> ownerships;
             try
             {
                 ownerships = probe.effectiveOwnership(keyspace);
-            } catch (IllegalStateException ex)
+            } 
+            catch (IllegalStateException ex)
             {
                 ownerships = probe.getOwnership();
-                System.out.printf("Note: Ownership information does not include topology; for complete information, specify a keyspace%n");
+                errors.append("Note: " + ex.getMessage() + "%n");
+                showEffectiveOwnership = false;
+            } 
+            catch (IllegalArgumentException ex)
+            {
+                System.out.printf("%nError: " + ex.getMessage() + "%n");
+                return;
             }
+
+            
             System.out.println();
             for (Entry<String, SetHostStat> entry : getOwnershipByDc(probe, resolveIp, tokensToEndpoints, ownerships).entrySet())
-                printDc(probe, format, entry.getKey(), endpointsToTokens, entry.getValue());
+                printDc(probe, format, entry.getKey(), endpointsToTokens, entry.getValue(),showEffectiveOwnership);
 
-            if (DatabaseDescriptor.getNumTokens() > 1)
+            if (haveVnodes)
             {
                 System.out.println("  Warning: \"nodetool ring\" is used to output all the tokens of a node.");
                 System.out.println("  To view status related info of a node use \"nodetool status\" instead.\n");
             }
+
+            System.out.printf("%n  " + errors.toString());
         }
 
         private void printDc(NodeProbe probe, String format,
                              String dc,
                              LinkedHashMultimap<String, String> endpointsToTokens,
-                             SetHostStat hoststats)
+                             SetHostStat hoststats,boolean showEffectiveOwnership)
         {
             Collection<String> liveNodes = probe.getLiveNodes();
             Collection<String> deadNodes = probe.getUnreachableNodes();
@@ -531,7 +628,7 @@ public class NodeTool
                 String load = loadMap.containsKey(endpoint)
                         ? loadMap.get(endpoint)
                         : "?";
-                String owns = stat.owns != null ? new DecimalFormat("##0.00%").format(stat.owns) : "?";
+                String owns = stat.owns != null && showEffectiveOwnership? new DecimalFormat("##0.00%").format(stat.owns) : "?";
                 System.out.printf(format, stat.ipOrDns(), rack, status, state, load, owns, stat.token);
             }
             System.out.println();
@@ -541,6 +638,11 @@ public class NodeTool
     @Command(name = "netstats", description = "Print network information on provided host (connecting node by default)")
     public static class NetStats extends NodeToolCmd
     {
+        @Option(title = "human_readable",
+                name = {"-H", "--human-readable"},
+                description = "Display bytes in human readable form, i.e. KB, MB, GB, TB")
+        private boolean humanReadable = false;
+
         @Override
         public void execute(NodeProbe probe)
         {
@@ -553,10 +655,19 @@ public class NodeTool
                 System.out.printf("%s %s%n", status.description, status.planId.toString());
                 for (SessionInfo info : status.sessions)
                 {
-                    System.out.printf("    %s%n", info.peer.toString());
+                    System.out.printf("    %s", info.peer.toString());
+                    // print private IP when it is used
+                    if (!info.peer.equals(info.connecting))
+                    {
+                        System.out.printf(" (using %s)", info.connecting.toString());
+                    }
+                    System.out.printf("%n");
                     if (!info.receivingSummaries.isEmpty())
                     {
-                        System.out.printf("        Receiving %d files, %d bytes total%n", info.getTotalFilesToReceive(), info.getTotalSizeToReceive());
+                        if (humanReadable)
+                            System.out.printf("        Receiving %d files, %s total. Already received %d files, %s total%n", info.getTotalFilesToReceive(), FileUtils.stringifyFileSize(info.getTotalSizeToReceive()), info.getTotalFilesReceived(), FileUtils.stringifyFileSize(info.getTotalSizeReceived()));
+                        else
+                            System.out.printf("        Receiving %d files, %d bytes total. Already received %d files, %d bytes total%n", info.getTotalFilesToReceive(), info.getTotalSizeToReceive(), info.getTotalFilesReceived(), info.getTotalSizeReceived());
                         for (ProgressInfo progress : info.getReceivingFiles())
                         {
                             System.out.printf("            %s%n", progress.toString());
@@ -564,7 +675,10 @@ public class NodeTool
                     }
                     if (!info.sendingSummaries.isEmpty())
                     {
-                        System.out.printf("        Sending %d files, %d bytes total%n", info.getTotalFilesToSend(), info.getTotalSizeToSend());
+                        if (humanReadable)
+                            System.out.printf("        Sending %d files, %s total. Already sent %d files, %s total%n", info.getTotalFilesToSend(), FileUtils.stringifyFileSize(info.getTotalSizeToSend()), info.getTotalFilesSent(), FileUtils.stringifyFileSize(info.getTotalSizeSent()));
+                        else
+                            System.out.printf("        Sending %d files, %d bytes total. Already sent %d files, %d bytes total%n", info.getTotalFilesToSend(), info.getTotalSizeToSend(), info.getTotalFilesSent(), info.getTotalSizeSent());
                         for (ProgressInfo progress : info.getSendingFiles())
                         {
                             System.out.printf("            %s%n", progress.toString());
@@ -573,32 +687,35 @@ public class NodeTool
                 }
             }
 
-            System.out.printf("Read Repair Statistics:%nAttempted: %d%nMismatch (Blocking): %d%nMismatch (Background): %d%n", probe.getReadRepairAttempted(), probe.getReadRepairRepairedBlocking(), probe.getReadRepairRepairedBackground());
+            if (!probe.isStarting())
+            {
+                System.out.printf("Read Repair Statistics:%nAttempted: %d%nMismatch (Blocking): %d%nMismatch (Background): %d%n", probe.getReadRepairAttempted(), probe.getReadRepairRepairedBlocking(), probe.getReadRepairRepairedBackground());
 
-            MessagingServiceMBean ms = probe.msProxy;
-            System.out.printf("%-25s", "Pool Name");
-            System.out.printf("%10s", "Active");
-            System.out.printf("%10s", "Pending");
-            System.out.printf("%15s%n", "Completed");
+                MessagingServiceMBean ms = probe.msProxy;
+                System.out.printf("%-25s", "Pool Name");
+                System.out.printf("%10s", "Active");
+                System.out.printf("%10s", "Pending");
+                System.out.printf("%15s%n", "Completed");
 
-            int pending;
-            long completed;
+                int pending;
+                long completed;
 
-            pending = 0;
-            for (int n : ms.getCommandPendingTasks().values())
-                pending += n;
-            completed = 0;
-            for (long n : ms.getCommandCompletedTasks().values())
-                completed += n;
-            System.out.printf("%-25s%10s%10s%15s%n", "Commands", "n/a", pending, completed);
+                pending = 0;
+                for (int n : ms.getCommandPendingTasks().values())
+                    pending += n;
+                completed = 0;
+                for (long n : ms.getCommandCompletedTasks().values())
+                    completed += n;
+                System.out.printf("%-25s%10s%10s%15s%n", "Commands", "n/a", pending, completed);
 
-            pending = 0;
-            for (int n : ms.getResponsePendingTasks().values())
-                pending += n;
-            completed = 0;
-            for (long n : ms.getResponseCompletedTasks().values())
-                completed += n;
-            System.out.printf("%-25s%10s%10s%15s%n", "Responses", "n/a", pending, completed);
+                pending = 0;
+                for (int n : ms.getResponsePendingTasks().values())
+                    pending += n;
+                completed = 0;
+                for (long n : ms.getResponseCompletedTasks().values())
+                    completed += n;
+                System.out.printf("%-25s%10s%10s%15s%n", "Responses", "n/a", pending, completed);
+            }
         }
     }
 
@@ -610,6 +727,11 @@ public class NodeTool
 
         @Option(name = "-i", description = "Ignore the list of column families and display the remaining cfs")
         private boolean ignore = false;
+
+        @Option(title = "human_readable",
+                name = {"-H", "--human-readable"},
+                description = "Display bytes in human readable form, i.e. KB, MB, GB, TB")
+        private boolean humanReadable = false;
 
         @Override
         public void execute(NodeProbe probe)
@@ -680,9 +802,9 @@ public class NodeTool
                                               : Double.NaN;
 
                 System.out.println("\tRead Count: " + keyspaceReadCount);
-                System.out.println("\tRead Latency: " + format("%s", keyspaceReadLatency) + " ms.");
+                System.out.println("\tRead Latency: " + String.format("%s", keyspaceReadLatency) + " ms.");
                 System.out.println("\tWrite Count: " + keyspaceWriteCount);
-                System.out.println("\tWrite Latency: " + format("%s", keyspaceWriteLatency) + " ms.");
+                System.out.println("\tWrite Latency: " + String.format("%s", keyspaceWriteLatency) + " ms.");
                 System.out.println("\tPending Flushes: " + keyspacePendingFlushes);
 
                 // print out column family statistics for this keyspace
@@ -717,12 +839,41 @@ public class NodeTool
                                 System.out.println("]");
                         }
                     }
-                    System.out.println("\t\tSpace used (live), bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "LiveDiskSpaceUsed"));
-                    System.out.println("\t\tSpace used (total), bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "TotalDiskSpaceUsed"));
-                    System.out.println("\t\tSpace used by snapshots (total), bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "SnapshotsSize"));
+
+                    Long memtableOffHeapSize = null;
+                    Long bloomFilterOffHeapSize = null;
+                    Long indexSummaryOffHeapSize = null;
+                    Long compressionMetadataOffHeapSize = null;
+
+                    Long offHeapSize = null;
+
+                    try
+                    {
+                        memtableOffHeapSize = (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableOffHeapSize");
+                        bloomFilterOffHeapSize = (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterOffHeapMemoryUsed");
+                        indexSummaryOffHeapSize = (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "IndexSummaryOffHeapMemoryUsed");
+                        compressionMetadataOffHeapSize = (Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "CompressionMetadataOffHeapMemoryUsed");
+
+                        offHeapSize = memtableOffHeapSize + bloomFilterOffHeapSize + indexSummaryOffHeapSize + compressionMetadataOffHeapSize;
+                    }
+                    catch (RuntimeException e)
+                    {
+                        // offheap-metrics introduced in 2.1.3 - older versions do not have the appropriate mbeans
+                        if (!(e.getCause() instanceof InstanceNotFoundException))
+                            throw e;
+                    }
+
+                    System.out.println("\t\tSpace used (live): " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "LiveDiskSpaceUsed"), humanReadable));
+                    System.out.println("\t\tSpace used (total): " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "TotalDiskSpaceUsed"), humanReadable));
+                    System.out.println("\t\tSpace used by snapshots (total): " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "SnapshotsSize"), humanReadable));
+                    if (offHeapSize != null)
+                        System.out.println("\t\tOff heap memory used (total): " + format(offHeapSize, humanReadable));
                     System.out.println("\t\tSSTable Compression Ratio: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "CompressionRatio"));
+                    System.out.println("\t\tNumber of keys (estimate): " + probe.getColumnFamilyMetric(keyspaceName, cfName, "EstimatedRowCount"));
                     System.out.println("\t\tMemtable cell count: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableColumnsCount"));
-                    System.out.println("\t\tMemtable data size, bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableLiveDataSize"));
+                    System.out.println("\t\tMemtable data size: " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableLiveDataSize"), humanReadable));
+                    if (memtableOffHeapSize != null)
+                        System.out.println("\t\tMemtable off heap memory used: " + format(memtableOffHeapSize, humanReadable));
                     System.out.println("\t\tMemtable switch count: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MemtableSwitchCount"));
                     System.out.println("\t\tLocal read count: " + ((JmxReporter.TimerMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "ReadLatency")).getCount());
                     double localReadLatency = ((JmxReporter.TimerMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "ReadLatency")).getMean() / 1000;
@@ -734,18 +885,33 @@ public class NodeTool
                     System.out.printf("\t\tLocal write latency: %01.3f ms%n", localWLatency);
                     System.out.println("\t\tPending flushes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "PendingFlushes"));
                     System.out.println("\t\tBloom filter false positives: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterFalsePositives"));
-                    System.out.println("\t\tBloom filter false ratio: " + format("%01.5f", probe.getColumnFamilyMetric(keyspaceName, cfName, "RecentBloomFilterFalseRatio")));
-                    System.out.println("\t\tBloom filter space used, bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterDiskSpaceUsed"));
-                    System.out.println("\t\tCompacted partition minimum bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MinRowSize"));
-                    System.out.println("\t\tCompacted partition maximum bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MaxRowSize"));
-                    System.out.println("\t\tCompacted partition mean bytes: " + probe.getColumnFamilyMetric(keyspaceName, cfName, "MeanRowSize"));
-                    System.out.println("\t\tAverage live cells per slice (last five minutes): " + ((JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "LiveScannedHistogram")).getMean());
-                    System.out.println("\t\tAverage tombstones per slice (last five minutes): " + ((JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "TombstoneScannedHistogram")).getMean());
+                    System.out.printf("\t\tBloom filter false ratio: %s%n", String.format("%01.5f", probe.getColumnFamilyMetric(keyspaceName, cfName, "RecentBloomFilterFalseRatio")));
+                    System.out.println("\t\tBloom filter space used: " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "BloomFilterDiskSpaceUsed"), humanReadable));
+                    if (bloomFilterOffHeapSize != null)
+                        System.out.println("\t\tBloom filter off heap memory used: " + format(bloomFilterOffHeapSize, humanReadable));
+                    if (indexSummaryOffHeapSize != null)
+                        System.out.println("\t\tIndex summary off heap memory used: " + format(indexSummaryOffHeapSize, humanReadable));
+                    if (compressionMetadataOffHeapSize != null)
+                        System.out.println("\t\tCompression metadata off heap memory used: " + format(compressionMetadataOffHeapSize, humanReadable));
+
+                    System.out.println("\t\tCompacted partition minimum bytes: " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MinRowSize"), humanReadable));
+                    System.out.println("\t\tCompacted partition maximum bytes: " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MaxRowSize"), humanReadable));
+                    System.out.println("\t\tCompacted partition mean bytes: " + format((Long) probe.getColumnFamilyMetric(keyspaceName, cfName, "MeanRowSize"), humanReadable));
+                    JmxReporter.HistogramMBean histogram = (JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "LiveScannedHistogram");
+                    System.out.println("\t\tAverage live cells per slice (last five minutes): " + histogram.getMean());
+                    System.out.println("\t\tMaximum live cells per slice (last five minutes): " + histogram.getMax());
+                    histogram = (JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspaceName, cfName, "TombstoneScannedHistogram");
+                    System.out.println("\t\tAverage tombstones per slice (last five minutes): " + histogram.getMean());
+                    System.out.println("\t\tMaximum tombstones per slice (last five minutes): " + histogram.getMax());
 
                     System.out.println("");
                 }
                 System.out.println("----------------");
             }
+        }
+
+        private String format(long bytes, boolean humanReadable) {
+            return humanReadable ? FileUtils.stringifyFileSize(bytes) : Long.toString(bytes);
         }
 
         /**
@@ -826,6 +992,81 @@ public class NodeTool
         }
     }
 
+    @Command(name = "toppartitions", description = "Sample and print the most active partitions for a given column family")
+    public static class TopPartitions extends NodeToolCmd
+    {
+        @Arguments(usage = "<keyspace> <cfname> <duration>", description = "The keyspace, column family name, and duration in milliseconds")
+        private List<String> args = new ArrayList<>();
+        @Option(name = "-s", description = "Capacity of stream summary, closer to the actual cardinality of partitions will yield more accurate results (Default: 256)")
+        private int size = 256;
+        @Option(name = "-k", description = "Number of the top partitions to list (Default: 10)")
+        private int topCount = 10;
+        @Option(name = "-a", description = "Comma separated list of samplers to use (Default: all)")
+        private String samplers = join(Sampler.values(), ',');
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            checkArgument(args.size() == 3, "toppartitions requires keyspace, column family name, and duration");
+            checkArgument(topCount < size, "TopK count (-k) option must be smaller then the summary capacity (-s)");
+            String keyspace = args.get(0);
+            String cfname = args.get(1);
+            Integer duration = Integer.parseInt(args.get(2));
+            // generate the list of samplers
+            List<Sampler> targets = Lists.newArrayList();
+            for (String s : samplers.split(","))
+            {
+                try
+                {
+                    targets.add(Sampler.valueOf(s.toUpperCase()));
+                } catch (Exception e)
+                {
+                    throw new IllegalArgumentException(s + " is not a valid sampler, choose one of: " + join(Sampler.values(), ", "));
+                }
+            }
+
+            Map<Sampler, CompositeData> results;
+            try
+            {
+                results = probe.getPartitionSample(keyspace, cfname, size, duration, topCount, targets);
+            } catch (OpenDataException e)
+            {
+                throw new RuntimeException(e);
+            }
+            boolean first = true;
+            for(Entry<Sampler, CompositeData> result : results.entrySet())
+            {
+                CompositeData sampling = result.getValue();
+                // weird casting for http://bugs.sun.com/view_bug.do?bug_id=6548436
+                List<CompositeData> topk = (List<CompositeData>) (Object) Lists.newArrayList(((TabularDataSupport) sampling.get("partitions")).values());
+                Collections.sort(topk, new Ordering<CompositeData>()
+                {
+                    public int compare(CompositeData left, CompositeData right)
+                    {
+                        return Long.compare((long) right.get("count"), (long) left.get("count"));
+                    }
+                });
+                if(!first)
+                    System.out.println();
+                System.out.println(result.getKey().toString()+ " Sampler:");
+                System.out.printf("  Cardinality: ~%d (%d capacity)%n", (long) sampling.get("cardinality"), size);
+                System.out.printf("  Top %d partitions:%n", topCount);
+                if (topk.size() == 0)
+                {
+                    System.out.println("\tNothing recorded during sampling period...");
+                } else
+                {
+                    int offset = 0;
+                    for (CompositeData entry : topk)
+                        offset = Math.max(offset, entry.get("string").toString().length());
+                    System.out.printf("\t%-" + offset + "s%10s%10s%n", "Partition", "Count", "+/-");
+                    for (CompositeData entry : topk)
+                        System.out.printf("\t%-" + offset + "s%10d%10d%n", entry.get("string").toString(), entry.get("count"), entry.get("error"));
+                }
+                first = false;
+            }
+        }
+    }
+
     @Command(name = "cfhistograms", description = "Print statistic histograms for a given column family")
     public static class CfHistograms extends NodeToolCmd
     {
@@ -840,35 +1081,23 @@ public class NodeTool
             String keyspace = args.get(0);
             String cfname = args.get(1);
 
-            // calculate percentile of row size and column count
-            long[] estimatedRowSize = (long[]) probe.getColumnFamilyMetric(keyspace, cfname, "EstimatedRowSizeHistogram");
-            long[] estimatedColumnCount = (long[]) probe.getColumnFamilyMetric(keyspace, cfname, "EstimatedColumnCountHistogram");
+            ColumnFamilyStoreMBean store = probe.getCfsProxy(keyspace, cfname);
 
-            long[] bucketOffsets = new EstimatedHistogram().getBucketOffsets();
-            EstimatedHistogram rowSizeHist = new EstimatedHistogram(bucketOffsets, estimatedRowSize);
-            EstimatedHistogram columnCountHist = new EstimatedHistogram(bucketOffsets, estimatedColumnCount);
+            long[] estimatedRowSizeHistogram = store.getEstimatedRowSizeHistogram();
+            long[] estimatedColumnCountHistogram = store.getEstimatedColumnCountHistogram();
 
-            // build arrays to store percentile values
-            double[] estimatedRowSizePercentiles = new double[7];
-            double[] estimatedColumnCountPercentiles = new double[7];
-            double[] offsetPercentiles = new double[]{0.5, 0.75, 0.95, 0.98, 0.99};
-            for (int i = 0; i < offsetPercentiles.length; i++)
+            if (ArrayUtils.isEmpty(estimatedRowSizeHistogram) || ArrayUtils.isEmpty(estimatedColumnCountHistogram))
             {
-                estimatedRowSizePercentiles[i] = rowSizeHist.percentile(offsetPercentiles[i]);
-                estimatedColumnCountPercentiles[i] = columnCountHist.percentile(offsetPercentiles[i]);
+                System.err.println("No SSTables exists, unable to calculate 'Partition Size' and 'Cell Count' percentiles");
             }
 
-            // min value
-            estimatedRowSizePercentiles[5] = rowSizeHist.min();
-            estimatedColumnCountPercentiles[5] = columnCountHist.min();
-            // max value
-            estimatedRowSizePercentiles[6] = rowSizeHist.max();
-            estimatedColumnCountPercentiles[6] = columnCountHist.max();
-
+            // calculate percentile of row size and column count
             String[] percentiles = new String[]{"50%", "75%", "95%", "98%", "99%", "Min", "Max"};
-            double[] readLatency = probe.metricPercentilesAsArray((JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspace, cfname, "ReadLatency"));
-            double[] writeLatency = probe.metricPercentilesAsArray((JmxReporter.TimerMBean) probe.getColumnFamilyMetric(keyspace, cfname, "WriteLatency"));
-            double[] sstablesPerRead = probe.metricPercentilesAsArray((JmxReporter.HistogramMBean) probe.getColumnFamilyMetric(keyspace, cfname, "SSTablesPerReadHistogram"));
+            double[] readLatency = probe.metricPercentilesAsArray(store.getRecentReadLatencyHistogramMicros());
+            double[] writeLatency = probe.metricPercentilesAsArray(store.getRecentWriteLatencyHistogramMicros());
+            double[] estimatedRowSizePercentiles = probe.metricPercentilesAsArray(estimatedRowSizeHistogram);
+            double[] estimatedColumnCountPercentiles = probe.metricPercentilesAsArray(estimatedColumnCountHistogram);
+            double[] sstablesPerRead = probe.metricPercentilesAsArray(store.getRecentSSTablesPerReadHistogram());
 
             System.out.println(format("%s/%s histograms", keyspace, cfname));
             System.out.println(format("%-10s%10s%18s%18s%18s%18s",
@@ -1020,6 +1249,11 @@ public class NodeTool
                 description = "Skip corrupted partitions even when scrubbing counter tables. (default false)")
         private boolean skipCorrupted = false;
 
+        @Option(title = "no_validate",
+                name = {"-n", "--no-validate"},
+                description = "Do not validate columns using column validator")
+        private boolean noValidation = false;
+
         @Override
         public void execute(NodeProbe probe)
         {
@@ -1030,7 +1264,7 @@ public class NodeTool
             {
                 try
                 {
-                    probe.scrub(System.out, disableSnapshot, skipCorrupted, keyspace, cfnames);
+                    probe.scrub(System.out, disableSnapshot, skipCorrupted, !noValidation, keyspace, cfnames);
                 } catch (Exception e)
                 {
                     throw new RuntimeException("Error occurred during flushing", e);
@@ -1120,32 +1354,70 @@ public class NodeTool
     @Command(name = "compactionstats", description = "Print statistics on compactions")
     public static class CompactionStats extends NodeToolCmd
     {
+        @Option(title = "human_readable",
+                name = {"-H", "--human-readable"},
+                description = "Display bytes in human readable form, i.e. KB, MB, GB, TB")
+        private boolean humanReadable = false;
+
         @Override
         public void execute(NodeProbe probe)
         {
             int compactionThroughput = probe.getCompactionThroughput();
             CompactionManagerMBean cm = probe.getCompactionManagerProxy();
             System.out.println("pending tasks: " + probe.getCompactionMetric("PendingTasks"));
-            if (cm.getCompactions().size() > 0)
-                System.out.printf("%25s%16s%16s%16s%16s%10s%10s%n", "compaction type", "keyspace", "table", "completed", "total", "unit", "progress");
             long remainingBytes = 0;
-            for (Map<String, String> c : cm.getCompactions())
+            List<Map<String, String>> compactions = cm.getCompactions();
+            if (!compactions.isEmpty())
             {
-                String percentComplete = new Long(c.get("total")) == 0
-                                         ? "n/a"
-                                         : new DecimalFormat("0.00").format((double) new Long(c.get("completed")) / new Long(c.get("total")) * 100) + "%";
-                System.out.printf("%25s%16s%16s%16s%16s%10s%10s%n", c.get("taskType"), c.get("keyspace"), c.get("columnfamily"), c.get("completed"), c.get("total"), c.get("unit"), percentComplete);
-                if (c.get("taskType").equals(OperationType.COMPACTION.toString()))
-                    remainingBytes += (new Long(c.get("total")) - new Long(c.get("completed")));
-            }
-            long remainingTimeInSecs = compactionThroughput == 0 || remainingBytes == 0
-                                       ? -1
-                                       : (remainingBytes) / (1024L * 1024L * compactionThroughput);
-            String remainingTime = remainingTimeInSecs < 0
-                                   ? "n/a"
-                                   : format("%dh%02dm%02ds", remainingTimeInSecs / 3600, (remainingTimeInSecs % 3600) / 60, (remainingTimeInSecs % 60));
+                List<String[]> lines = new ArrayList<>();
+                int[] columnSizes = new int[] { 0, 0, 0, 0, 0, 0, 0 };
 
-            System.out.printf("%25s%10s%n", "Active compaction remaining time : ", remainingTime);
+                addLine(lines, columnSizes, "compaction type", "keyspace", "table", "completed", "total", "unit", "progress");
+                for (Map<String, String> c : compactions)
+                {
+                    long total = Long.parseLong(c.get("total"));
+                    long completed = Long.parseLong(c.get("completed"));
+                    String taskType = c.get("taskType");
+                    String keyspace = c.get("keyspace");
+                    String columnFamily = c.get("columnfamily");
+                    String completedStr = humanReadable ? FileUtils.stringifyFileSize(completed) : Long.toString(completed);
+                    String totalStr = humanReadable ? FileUtils.stringifyFileSize(total) : Long.toString(total);
+                    String unit = c.get("unit");
+                    String percentComplete = total == 0 ? "n/a" : new DecimalFormat("0.00").format((double) completed / total * 100) + "%";
+                    addLine(lines, columnSizes, taskType, keyspace, columnFamily, completedStr, totalStr, unit, percentComplete);
+                    if (taskType.equals(OperationType.COMPACTION.toString()))
+                        remainingBytes += total - completed;
+                }
+
+                StringBuilder buffer = new StringBuilder();
+                for (int columnSize : columnSizes) {
+                    buffer.append("%");
+                    buffer.append(columnSize + 3);
+                    buffer.append("s");
+                }
+                buffer.append("%n");
+                String format = buffer.toString();
+
+                for (String[] line : lines)
+                {
+                    System.out.printf(format, line[0], line[1], line[2], line[3], line[4], line[5], line[6]);
+                }
+
+                String remainingTime = "n/a";
+                if (compactionThroughput != 0)
+                {
+                    long remainingTimeInSecs = remainingBytes / (1024L * 1024L * compactionThroughput);
+                    remainingTime = format("%dh%02dm%02ds", remainingTimeInSecs / 3600, (remainingTimeInSecs % 3600) / 60, (remainingTimeInSecs % 60));
+                }
+                System.out.printf("%25s%10s%n", "Active compaction remaining time : ", remainingTime);
+            }
+        }
+
+        private void addLine(List<String[]> lines, int[] columnSizes, String... columns) {
+            lines.add(columns);
+            for (int i = 0; i < columns.length; i++) {
+                columnSizes[i] = Math.max(columnSizes[i], columns[i].length());
+            }
         }
     }
 
@@ -1312,20 +1584,20 @@ public class NodeTool
         }
     }
 
-    @Command(name = "getstreamthroughput", description = "Print the MB/s throughput cap for streaming in the system")
+    @Command(name = "getstreamthroughput", description = "Print the Mb/s throughput cap for streaming in the system")
     public static class GetStreamThroughput extends NodeToolCmd
     {
         @Override
         public void execute(NodeProbe probe)
         {
-            System.out.println("Current stream throughput: " + probe.getStreamThroughput() + " MB/s");
+            System.out.println("Current stream throughput: " + probe.getStreamThroughput() + " Mb/s");
         }
     }
 
     @Command(name = "getendpoints", description = "Print the end points that owns the key")
     public static class GetEndpoints extends NodeToolCmd
     {
-        @Arguments(usage = "<keyspace> <cfname> <key>", description = "The keyspace, the column family, and the key for which we need to find the endpoint")
+        @Arguments(usage = "<keyspace> <cfname> <key>", description = "The keyspace, the column family, and the partition key for which we need to find the endpoint")
         private List<String> args = new ArrayList<>();
 
         @Override
@@ -1406,26 +1678,6 @@ public class NodeTool
         }
     }
 
-    @Command(name = "taketoken", description = "Move the token(s) from the existing owner(s) to this node.  For vnodes only.")
-    public static class TakeToken extends NodeToolCmd
-    {
-        @Arguments(usage = "<token, ...>", description = "Token(s) to take", required = true)
-        private List<String> tokens = new ArrayList<String>();
-
-        @Override
-        public void execute(NodeProbe probe)
-        {
-            try
-            {
-                probe.takeTokens(tokens);
-            }
-            catch (IOException e)
-            {
-                throw new RuntimeException("Error taking tokens", e);
-            }
-        }
-    }
-
     @Command(name = "join", description = "Join the ring")
     public static class Join extends NodeToolCmd
     {
@@ -1492,10 +1744,11 @@ public class NodeTool
         @Override
         public void execute(NodeProbe probe)
         {
+            StorageProxyMBean sp = probe.getSpProxy();
             String[] percentiles = new String[]{"50%", "75%", "95%", "98%", "99%", "Min", "Max"};
-            double[] readLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("Read"));
-            double[] writeLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("Write"));
-            double[] rangeLatency = probe.metricPercentilesAsArray(probe.getProxyMetric("RangeSlice"));
+            double[] readLatency = probe.metricPercentilesAsArray(sp.getRecentReadLatencyHistogramMicros());
+            double[] writeLatency = probe.metricPercentilesAsArray(sp.getRecentWriteLatencyHistogramMicros());
+            double[] rangeLatency = probe.metricPercentilesAsArray(sp.getRecentRangeLatencyHistogramMicros());
 
             System.out.println("proxy histograms");
             System.out.println(format("%-10s%18s%18s%18s",
@@ -1586,6 +1839,9 @@ public class NodeTool
         @Option(title = "parallel", name = {"-par", "--parallel"}, description = "Use -par to carry out a parallel repair")
         private boolean parallel = false;
 
+        @Option(title = "dc parallel", name = {"-dcpar", "--dc-parallel"}, description = "Use -dcpar to repair data centers in parallel.")
+        private boolean dcParallel = false;
+
         @Option(title = "local_dc", name = {"-local", "--in-local-dc"}, description = "Use -local to only repair against nodes in the same datacenter")
         private boolean localDC = false;
 
@@ -1613,10 +1869,19 @@ public class NodeTool
             List<String> keyspaces = parseOptionalKeyspace(args, probe);
             String[] cfnames = parseOptionalColumnFamilies(args);
 
+            if (primaryRange && (!specificDataCenters.isEmpty() || !specificHosts.isEmpty()))
+                throw new RuntimeException("Primary range repair should be performed on all nodes in the cluster.");
+
             for (String keyspace : keyspaces)
             {
                 try
                 {
+                    RepairParallelism parallelismDegree = RepairParallelism.SEQUENTIAL;
+                    if (parallel)
+                        parallelismDegree = RepairParallelism.PARALLEL;
+                    else if (dcParallel)
+                        parallelismDegree = RepairParallelism.DATACENTER_AWARE;
+
                     Collection<String> dataCenters = null;
                     Collection<String> hosts = null;
                     if (!specificDataCenters.isEmpty())
@@ -1626,9 +1891,9 @@ public class NodeTool
                     else if(!specificHosts.isEmpty())
                         hosts = newArrayList(specificHosts);
                     if (!startToken.isEmpty() || !endToken.isEmpty())
-                        probe.forceRepairRangeAsync(System.out, keyspace, !parallel, dataCenters,hosts, startToken, endToken, !incrementalRepair);
+                        probe.forceRepairRangeAsync(System.out, keyspace, parallelismDegree, dataCenters,hosts, startToken, endToken, !incrementalRepair);
                     else
-                        probe.forceRepairAsync(System.out, keyspace, !parallel, dataCenters, hosts, primaryRange, !incrementalRepair, cfnames);
+                        probe.forceRepairAsync(System.out, keyspace, parallelismDegree, dataCenters, hosts, primaryRange, !incrementalRepair, cfnames);
                 } catch (Exception e)
                 {
                     throw new RuntimeException("Error occurred during repair", e);
@@ -1688,10 +1953,23 @@ public class NodeTool
         }
     }
 
-    @Command(name = "setstreamthroughput", description = "Set the MB/s throughput cap for streaming in the system, or 0 to disable throttling")
+    @Command(name = "sethintedhandoffthrottlekb", description =  "Set hinted handoff throttle in kb per second, per delivery thread.")
+    public static class SetHintedHandoffThrottleInKB extends NodeToolCmd
+    {
+        @Arguments(title = "throttle_in_kb", usage = "<value_in_kb_per_sec>", description = "Value in KB per second", required = true)
+        private Integer throttleInKB = null;
+
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            probe.setHintedHandoffThrottleInKB(throttleInKB);
+        }
+    }
+
+    @Command(name = "setstreamthroughput", description = "Set the Mb/s throughput cap for streaming in the system, or 0 to disable throttling")
     public static class SetStreamThroughput extends NodeToolCmd
     {
-        @Arguments(title = "stream_throughput", usage = "<value_in_mb>", description = "Value in MB, 0 to disable throttling", required = true)
+        @Arguments(title = "stream_throughput", usage = "<value_in_mb>", description = "Value in Mb, 0 to disable throttling", required = true)
         private Integer streamThroughput = null;
 
         @Override
@@ -1727,6 +2005,9 @@ public class NodeTool
         @Option(title = "tag", name = {"-t", "--tag"}, description = "The name of the snapshot")
         private String snapshotName = Long.toString(System.currentTimeMillis());
 
+        @Option(title = "kclist", name = { "-kc", "--kc-list" }, description = "The list of Keyspace.Column family to take snapshot.(you must not specify only keyspace)")
+        private String kcList = null;
+
         @Override
         public void execute(NodeProbe probe)
         {
@@ -1736,19 +2017,40 @@ public class NodeTool
 
                 sb.append("Requested creating snapshot(s) for ");
 
-                if (keyspaces.isEmpty())
-                    sb.append("[all keyspaces]");
+                // Create a separate path for kclist to avoid breaking of already existing scripts
+                if (null != kcList && !kcList.isEmpty())
+                {
+                    kcList = kcList.replace(" ", "");
+                    if (keyspaces.isEmpty() && null == columnFamily)
+                        sb.append("[").append(kcList).append("]");
+                    else
+                    {
+                        throw new IOException(
+                                "When specifying the Keyspace columfamily list for a snapshot, you should not specify columnfamily");
+                    }
+                    if (!snapshotName.isEmpty())
+                        sb.append(" with snapshot name [").append(snapshotName).append("]");
+                    System.out.println(sb.toString());
+                    probe.takeMultipleColumnFamilySnapshot(snapshotName, kcList.split(","));
+                    System.out.println("Snapshot directory: " + snapshotName);
+                }
                 else
-                    sb.append("[").append(join(keyspaces, ", ")).append("]");
+                {
+                    if (keyspaces.isEmpty())
+                        sb.append("[all keyspaces]");
+                    else
+                        sb.append("[").append(join(keyspaces, ", ")).append("]");
 
-                if (!snapshotName.isEmpty())
-                    sb.append(" with snapshot name [").append(snapshotName).append("]");
+                    if (!snapshotName.isEmpty())
+                        sb.append(" with snapshot name [").append(snapshotName).append("]");
 
-                System.out.println(sb.toString());
+                    System.out.println(sb.toString());
 
-                probe.takeSnapshot(snapshotName, columnFamily, toArray(keyspaces, String.class));
-                System.out.println("Snapshot directory: " + snapshotName);
-            } catch (IOException e)
+                    probe.takeSnapshot(snapshotName, columnFamily, toArray(keyspaces, String.class));
+                    System.out.println("Snapshot directory: " + snapshotName);
+                }
+            }
+            catch (IOException e)
             {
                 throw new RuntimeException("Error during taking a snapshot", e);
             }
@@ -1826,8 +2128,10 @@ public class NodeTool
             unreachableNodes = probe.getUnreachableNodes();
             hostIDMap = probe.getHostIdMap();
             epSnitchInfo = probe.getEndpointSnitchInfoProxy();
+            
+            StringBuffer errors = new StringBuffer();
 
-            Map<InetAddress, Float> ownerships;
+            Map<InetAddress, Float> ownerships = null;
             try
             {
                 ownerships = probe.effectiveOwnership(keyspace);
@@ -1835,7 +2139,12 @@ public class NodeTool
             } catch (IllegalStateException e)
             {
                 ownerships = probe.getOwnership();
-                System.out.printf("Note: Ownership information does not include topology; for complete information, specify a keyspace%n");
+                errors.append("Note: " + e.getMessage() + "%n");
+            }
+            catch (IllegalArgumentException ex)
+            {
+                System.out.printf("%nError: " + ex.getMessage() + "%n");
+                System.exit(1);
             }
 
             Map<String, SetHostStat> dcs = getOwnershipByDc(probe, resolveIp, tokensToEndpoints, ownerships);
@@ -1871,7 +2180,9 @@ public class NodeTool
                     printNode(endpoint.getHostAddress(), owns, tokens, hasEffectiveOwns, isTokenPerNode);
                 }
             }
-
+            
+            System.out.printf("%n" + errors.toString());
+            
         }
 
         private void findMaxAddressLength(Map<String, SetHostStat> dcs)
@@ -1910,7 +2221,7 @@ public class NodeTool
             else state = "N";
 
             load = loadMap.containsKey(endpoint) ? loadMap.get(endpoint) : "?";
-            strOwns = owns != null ? new DecimalFormat("##0.0%").format(owns) : "?";
+            strOwns = owns != null && hasEffectiveOwns ? new DecimalFormat("##0.0%").format(owns) : "?";
             hostID = hostIDMap.get(endpoint);
 
             try
@@ -2043,6 +2354,19 @@ public class NodeTool
         }
     }
 
+    @Command(name = "statusgossip", description = "Status of gossip")
+    public static class StatusGossip extends NodeToolCmd
+    {
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            System.out.println(
+                    probe.isGossipRunning()
+                    ? "running"
+                    : "not running");
+        }
+    }
+
     @Command(name = "statusthrift", description = "Status of thrift server")
     public static class StatusThrift extends NodeToolCmd
     {
@@ -2051,6 +2375,32 @@ public class NodeTool
         {
             System.out.println(
                     probe.isThriftServerRunning()
+                    ? "running"
+                    : "not running");
+        }
+    }
+
+    @Command(name = "statusbackup", description = "Status of incremental backup")
+    public static class StatusBackup extends NodeToolCmd
+    {
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            System.out.println(
+                    probe.isIncrementalBackupsEnabled()
+                    ? "running"
+                    : "not running");
+        }
+    }
+
+    @Command(name = "statushandoff", description = "Status of storing future hints on the current node")
+    public static class StatusHandoff extends NodeToolCmd
+    {
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            System.out.println(
+                    probe.isHandoffEnabled()
                     ? "running"
                     : "not running");
         }
@@ -2078,8 +2428,9 @@ public class NodeTool
             try
             {
                 probe.stopCassandraDaemon();
-            } catch (Exception ignored)
+            } catch (Exception e)
             {
+                JVMStabilityInspector.inspectThrowable(e);
                 // ignored
             }
             System.out.println("Cassandra has shutdown.");
@@ -2212,7 +2563,7 @@ public class NodeTool
         }
     }
 
-    @Command(name = "disablehandoff", description = "Disable gossip (effectively marking the node down)")
+    @Command(name = "disablehandoff", description = "Disable storing hinted handoffs")
     public static class DisableHandoff extends NodeToolCmd
     {
         @Override
@@ -2277,6 +2628,20 @@ public class NodeTool
         }
     }
 
+    @Command(name = "gcstats", description = "Print GC Statistics")
+    public static class GcStats extends NodeTool.NodeToolCmd
+    {
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            double[] stats = probe.getAndResetGCStats();
+            double mean = stats[2] / stats[5];
+            double stdev = Math.sqrt((stats[3] / stats[5]) - (mean * mean));
+            System.out.printf("%20s%20s%20s%20s%20s%20s%n", "Interval (ms)", "Max GC Elapsed (ms)", "Total GC Elapsed (ms)", "Stdev GC Elapsed (ms)", "GC Reclaimed (MB)", "Collections");
+            System.out.printf("%20.0f%20.0f%20.0f%20.0f%20.0f%20.0f%n", stats[0], stats[1], stats[2], stdev, stats[4], stats[5]);
+        }
+    }
+
     @Command(name = "truncatehints", description = "Truncate all hints on the local node, or truncate hints for the endpoint(s) specified.")
     public static class TruncateHints extends NodeToolCmd
     {
@@ -2293,10 +2658,10 @@ public class NodeTool
         }
     }
     
-    @Command(name = "setlogginglevel", description = "Set a log level for a given logger. If both classQualifer and level are empty/null, it will reset based on the initial configuration")
+    @Command(name = "setlogginglevel", description = "Set the log level threshold for a given class. If both class and level are empty/null, it will reset to the initial configuration")
     public static class SetLoggingLevel extends NodeToolCmd
     {
-        @Arguments(usage = "<classQualifer> <level>", description = "The logger classQualifer and the logger level (can be empty)")
+        @Arguments(usage = "<class> <level>", description = "The class to change the level for and the log level threshold to set (can be empty)")
         private List<String> args = new ArrayList<>();
 
         @Override

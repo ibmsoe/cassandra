@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import re
 import time
 import calendar
@@ -110,7 +111,7 @@ def formatter_for(typname):
 
 @formatter_for('bytearray')
 def format_value_blob(val, colormap, **_):
-    bval = '0x' + ''.join('%02x' % ord(c) for c in val)
+    bval = '0x' + ''.join('%02x' % c for c in val)
     return colorme(bval, colormap, 'blob')
 formatter_for('buffer')(format_value_blob)
 
@@ -144,6 +145,13 @@ def format_floating_point_type(val, colormap, float_precision, **_):
     elif math.isinf(val):
         bval = 'Infinity'
     else:
+        exponent = int(math.log10(abs(val))) if abs(val) > sys.float_info.epsilon else -sys.maxint -1
+        if -4 <= exponent < float_precision:
+            # when this is true %g will not use scientific notation,
+            # increasing precision should not change this decision
+            # so we increase the precision to take into account the
+            # digits to the left of the decimal point
+            float_precision = float_precision + exponent + 1
         bval = '%.*g' % (float_precision, val)
     return colorme(bval, colormap, 'float')
 
@@ -215,7 +223,11 @@ def format_simple_collection(val, lbracket, rbracket, encoding,
 def format_value_list(val, encoding, colormap, time_format, float_precision, nullval, **_):
     return format_simple_collection(val, '[', ']', encoding, colormap,
                                     time_format, float_precision, nullval)
-formatter_for('tuple')(format_value_list)
+
+@formatter_for('tuple')
+def format_value_tuple(val, encoding, colormap, time_format, float_precision, nullval, **_):
+    return format_simple_collection(val, '(', ')', encoding, colormap,
+                                    time_format, float_precision, nullval)
 
 @formatter_for('set')
 def format_value_set(val, encoding, colormap, time_format, float_precision, nullval, **_):
@@ -242,6 +254,8 @@ def format_value_map(val, encoding, colormap, time_format, float_precision, null
     displaywidth = 4 * len(subs) + sum(k.displaywidth + v.displaywidth for (k, v) in subs)
     return FormattedValue(bval, coloredval, displaywidth)
 formatter_for('OrderedDict')(format_value_map)
+formatter_for('OrderedMap')(format_value_map)
+formatter_for('OrderedMapSerializedKey')(format_value_map)
 
 
 def format_value_utype(val, encoding, colormap, time_format, float_precision, nullval, **_):

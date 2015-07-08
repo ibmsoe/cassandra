@@ -31,6 +31,7 @@ import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
 import org.apache.cassandra.db.filter.IDiskAtomFilter;
 import org.apache.cassandra.db.filter.QueryFilter;
 import org.apache.cassandra.net.*;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -57,15 +58,16 @@ public class RowDataResolver extends AbstractRowResolver
     */
     public Row resolve() throws DigestMismatchException
     {
+        int replyCount = replies.size();
         if (logger.isDebugEnabled())
-            logger.debug("resolving {} responses", replies.size());
+            logger.debug("resolving {} responses", replyCount);
         long start = System.nanoTime();
 
         ColumnFamily resolved;
-        if (replies.size() > 1)
+        if (replyCount > 1)
         {
-            List<ColumnFamily> versions = new ArrayList<ColumnFamily>(replies.size());
-            List<InetAddress> endpoints = new ArrayList<InetAddress>(replies.size());
+            List<ColumnFamily> versions = new ArrayList<>(replyCount);
+            List<InetAddress> endpoints = new ArrayList<>(replyCount);
 
             for (MessageIn<ReadResponse> message : replies)
             {
@@ -119,6 +121,7 @@ public class RowDataResolver extends AbstractRowResolver
             Mutation mutation = new Mutation(keyspaceName, key.getKey(), diffCf);
             // use a separate verb here because we don't want these to be get the white glove hint-
             // on-timeout behavior that a "real" mutation gets
+            Tracing.trace("Sending read-repair-mutation to {}", endpoints.get(i));
             results.add(MessagingService.instance().sendRR(mutation.createMessage(MessagingService.Verb.READ_REPAIR),
                                                            endpoints.get(i)));
         }
@@ -158,7 +161,8 @@ public class RowDataResolver extends AbstractRowResolver
 
     public Row getData()
     {
-        return replies.iterator().next().payload.row();
+        assert !replies.isEmpty();
+        return replies.peek().payload.row();
     }
 
     public boolean isDataPresent()

@@ -18,7 +18,6 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +57,12 @@ public abstract class Constants
                 // We return null because that makes life easier for collections
                 return null;
             }
+
+            @Override
+            public String toString()
+            {
+                return "null";
+            }
         };
 
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
@@ -76,7 +81,7 @@ public abstract class Constants
         @Override
         public String toString()
         {
-            return null;
+            return "null";
         }
     };
 
@@ -324,7 +329,7 @@ public abstract class Constants
                 throw new InvalidRequestException("Invalid null value for counter increment");
             long increment = ByteBufferUtil.toLong(bytes);
             CellName cname = cf.getComparator().create(prefix, column);
-            cf.addCounter(cname, increment);
+            cf.addColumn(params.makeCounter(cname, increment));
         }
     }
 
@@ -346,7 +351,7 @@ public abstract class Constants
                 throw new InvalidRequestException("The negation of " + increment + " overflows supported counter precision (signed 8 bytes integer)");
 
             CellName cname = cf.getComparator().create(prefix, column);
-            cf.addCounter(cname, -increment);
+            cf.addColumn(params.makeCounter(cname, -increment));
         }
     }
 
@@ -362,7 +367,7 @@ public abstract class Constants
         public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
         {
             CellName cname = cf.getComparator().create(prefix, column);
-            if (column.type.isCollection())
+            if (column.type.isMultiCell())
                 cf.addAtom(params.makeRangeTombstone(cname.slice()));
             else
                 cf.addColumn(params.makeTombstone(cname));

@@ -37,8 +37,7 @@ import org.apache.cassandra.exceptions.AlreadyExistsException;
 import org.apache.cassandra.io.compress.CompressionParameters;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.thrift.CqlResult;
-import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /** A <code>CREATE TABLE</code> parsed from a CQL query statement. */
@@ -52,7 +51,16 @@ public class CreateTableStatement extends SchemaAlteringStatement
     private final List<ByteBuffer> columnAliases = new ArrayList<ByteBuffer>();
     private ByteBuffer valueAlias;
 
-    private final Map<ColumnIdentifier, AbstractType> columns = new HashMap<ColumnIdentifier, AbstractType>();
+    private boolean isDense;
+
+    // use a TreeMap to preserve ordering across JDK versions (see CASSANDRA-9492)
+    private final Map<ColumnIdentifier, AbstractType> columns = new TreeMap<>(new Comparator<ColumnIdentifier>()
+    {
+        public int compare(ColumnIdentifier o1, ColumnIdentifier o2)
+        {
+            return o1.bytes.compareTo(o2.bytes);
+        }
+    });
     private final Set<ColumnIdentifier> staticColumns;
     private final CFPropDefs properties;
     private final boolean ifNotExists;
@@ -105,22 +113,24 @@ public class CreateTableStatement extends SchemaAlteringStatement
         return columnDefs;
     }
 
-    public void announceMigration(boolean isLocalOnly) throws RequestValidationException
+    public boolean announceMigration(boolean isLocalOnly) throws RequestValidationException
     {
         try
         {
-           MigrationManager.announceNewColumnFamily(getCFMetaData(), isLocalOnly);
+            MigrationManager.announceNewColumnFamily(getCFMetaData(), isLocalOnly);
+            return true;
         }
         catch (AlreadyExistsException e)
         {
-            if (!ifNotExists)
-                throw e;
+            if (ifNotExists)
+                return false;
+            throw e;
         }
     }
 
-    public ResultMessage.SchemaChange.Change changeType()
+    public Event.SchemaChange changeEvent()
     {
-        return ResultMessage.SchemaChange.Change.CREATED;
+        return new Event.SchemaChange(Event.SchemaChange.Change.CREATED, Event.SchemaChange.Target.TABLE, keyspace(), columnFamily());
     }
 
     /**
@@ -145,7 +155,8 @@ public class CreateTableStatement extends SchemaAlteringStatement
     {
         cfmd.defaultValidator(defaultValidator)
             .keyValidator(keyValidator)
-            .addAllColumnDefinitions(getColumns(cfmd));
+            .addAllColumnDefinitions(getColumns(cfmd))
+            .isDense(isDense);
 
         cfmd.addColumnMetadataFromAliases(keyAliases, keyValidator, ColumnDefinition.Kind.PARTITION_KEY);
         cfmd.addColumnMetadataFromAliases(columnAliases, comparator.asAbstractType(), ColumnDefinition.Kind.CLUSTERING_COLUMN);
@@ -195,17 +206,21 @@ public class CreateTableStatement extends SchemaAlteringStatement
 
             CreateTableStatement stmt = new CreateTableStatement(cfName, properties, ifNotExists, staticColumns);
 
-            Map<ByteBuffer, CollectionType> definedCollections = null;
+            boolean hasCounters = false;
+            Map<ByteBuffer, CollectionType> definedMultiCellCollections = null;
             for (Map.Entry<ColumnIdentifier, CQL3Type.Raw> entry : definitions.entrySet())
             {
                 ColumnIdentifier id = entry.getKey();
                 CQL3Type pt = entry.getValue().prepare(keyspace());
-                if (pt.isCollection())
+                if (pt.isCollection() && ((CollectionType) pt.getType()).isMultiCell())
                 {
-                    if (definedCollections == null)
-                        definedCollections = new HashMap<ByteBuffer, CollectionType>();
-                    definedCollections.put(id.bytes, (CollectionType)pt.getType());
+                    if (definedMultiCellCollections == null)
+                        definedMultiCellCollections = new HashMap<>();
+                    definedMultiCellCollections.put(id.bytes, (CollectionType) pt.getType());
                 }
+                else if (entry.getValue().isCounter())
+                    hasCounters = true;
+
                 stmt.columns.put(id, pt.getType()); // we'll remove what is not a column below
             }
 
@@ -213,6 +228,8 @@ public class CreateTableStatement extends SchemaAlteringStatement
                 throw new InvalidRequestException("No PRIMARY KEY specifed (exactly one required)");
             else if (keyAliases.size() > 1)
                 throw new InvalidRequestException("Multiple PRIMARY KEYs specifed (exactly one required)");
+            else if (hasCounters && properties.getDefaultTimeToLive() > 0)
+                throw new InvalidRequestException("Cannot set default_time_to_live on a table with counters");
 
             List<ColumnIdentifier> kAliases = keyAliases.get(0);
 
@@ -229,6 +246,10 @@ public class CreateTableStatement extends SchemaAlteringStatement
             }
             stmt.keyValidator = keyTypes.size() == 1 ? keyTypes.get(0) : CompositeType.getInstance(keyTypes);
 
+            // Dense means that no part of the comparator stores a CQL column name. This means
+            // COMPACT STORAGE with at least one columnAliases (otherwise it's a thrift "static" CF).
+            stmt.isDense = useCompactStorage && !columnAliases.isEmpty();
+
             // Handle column aliases
             if (columnAliases.isEmpty())
             {
@@ -238,16 +259,16 @@ public class CreateTableStatement extends SchemaAlteringStatement
                     if (stmt.columns.isEmpty())
                         throw new InvalidRequestException("No definition found that is not part of the PRIMARY KEY");
 
-                    if (definedCollections != null)
-                        throw new InvalidRequestException("Collection types are not supported with COMPACT STORAGE");
+                    if (definedMultiCellCollections != null)
+                        throw new InvalidRequestException("Non-frozen collection types are not supported with COMPACT STORAGE");
 
                     stmt.comparator = new SimpleSparseCellNameType(UTF8Type.instance);
                 }
                 else
                 {
-                    stmt.comparator = definedCollections == null
+                    stmt.comparator = definedMultiCellCollections == null
                                     ? new CompoundSparseCellNameType(Collections.<AbstractType<?>>emptyList())
-                                    : new CompoundSparseCellNameType.WithCollection(Collections.<AbstractType<?>>emptyList(), ColumnToCollectionType.getInstance(definedCollections));
+                                    : new CompoundSparseCellNameType.WithCollection(Collections.<AbstractType<?>>emptyList(), ColumnToCollectionType.getInstance(definedMultiCellCollections));
                 }
             }
             else
@@ -256,7 +277,7 @@ public class CreateTableStatement extends SchemaAlteringStatement
                 // standard "dynamic" CF, otherwise it's a composite
                 if (useCompactStorage && columnAliases.size() == 1)
                 {
-                    if (definedCollections != null)
+                    if (definedMultiCellCollections != null)
                         throw new InvalidRequestException("Collection types are not supported with COMPACT STORAGE");
 
                     ColumnIdentifier alias = columnAliases.get(0);
@@ -286,16 +307,16 @@ public class CreateTableStatement extends SchemaAlteringStatement
 
                     if (useCompactStorage)
                     {
-                        if (definedCollections != null)
+                        if (definedMultiCellCollections != null)
                             throw new InvalidRequestException("Collection types are not supported with COMPACT STORAGE");
 
                         stmt.comparator = new CompoundDenseCellNameType(types);
                     }
                     else
                     {
-                        stmt.comparator = definedCollections == null
+                        stmt.comparator = definedMultiCellCollections == null
                                         ? new CompoundSparseCellNameType(types)
-                                        : new CompoundSparseCellNameType.WithCollection(types, ColumnToCollectionType.getInstance(definedCollections));
+                                        : new CompoundSparseCellNameType.WithCollection(types, ColumnToCollectionType.getInstance(definedMultiCellCollections));
                     }
                 }
             }
@@ -377,7 +398,7 @@ public class CreateTableStatement extends SchemaAlteringStatement
             AbstractType type = columns.get(t);
             if (type == null)
                 throw new InvalidRequestException(String.format("Unknown definition %s referenced in PRIMARY KEY", t));
-            if (type instanceof CollectionType)
+            if (type.isCollection() && type.isMultiCell())
                 throw new InvalidRequestException(String.format("Invalid collection type for PRIMARY KEY component %s", t));
 
             columns.remove(t);
@@ -411,16 +432,6 @@ public class CreateTableStatement extends SchemaAlteringStatement
         public void setCompactStorage()
         {
             useCompactStorage = true;
-        }
-
-        public void checkAccess(ClientState state)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public CqlResult execute(ClientState state, List<ByteBuffer> variables)
-        {
-            throw new UnsupportedOperationException();
         }
     }
 }
