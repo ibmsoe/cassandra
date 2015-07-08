@@ -18,11 +18,11 @@
 
 package org.apache.cassandra.serializers;
 
+import org.apache.cassandra.transport.Server;
+
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
-
-import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class ListSerializer<T> extends CollectionSerializer<List<T>>
 {
@@ -68,6 +68,9 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
             int n = readCollectionSize(input, version);
             for (int i = 0; i < n; i++)
                 elements.validate(readValue(input, version));
+
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after list value");
         }
         catch (BufferUnderflowException e)
         {
@@ -84,11 +87,51 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
             List<T> l = new ArrayList<T>(n);
             for (int i = 0; i < n; i++)
             {
+                // We can have nulls in lists that are used for IN values
                 ByteBuffer databb = readValue(input, version);
-                elements.validate(databb);
-                l.add(elements.deserialize(databb));
+                if (databb != null)
+                {
+                    elements.validate(databb);
+                    l.add(elements.deserialize(databb));
+                }
+                else
+                {
+                    l.add(null);
+                }
             }
+
+            if (input.hasRemaining())
+                throw new MarshalException("Unexpected extraneous bytes after list value");
+
             return l;
+        }
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    /**
+     * Returns the element at the given index in a list.
+     * @param serializedList a serialized list
+     * @param index the index to get
+     * @return the serialized element at the given index, or null if the index exceeds the list size
+     */
+    public ByteBuffer getElement(ByteBuffer serializedList, int index)
+    {
+        try
+        {
+            ByteBuffer input = serializedList.duplicate();
+            int n = readCollectionSize(input, Server.VERSION_3);
+            if (n <= index)
+                return null;
+
+            for (int i = 0; i < index; i++)
+            {
+                int length = input.getInt();
+                input.position(input.position() + length);
+            }
+            return readValue(input, Server.VERSION_3);
         }
         catch (BufferUnderflowException e)
         {
@@ -103,13 +146,9 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
         for (T element : value)
         {
             if (isFirst)
-            {
                 isFirst = false;
-            }
             else
-            {
                 sb.append("; ");
-            }
             sb.append(elements.toString(element));
         }
         return sb.toString();

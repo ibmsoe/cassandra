@@ -75,7 +75,12 @@ public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
 
     public ColumnFamily cloneMeShallow()
     {
-        return cloneMeShallow(getFactory(), isInsertReversed());
+        return cloneMeShallow(false);
+    }
+
+    public ColumnFamily cloneMeShallow(boolean reversed)
+    {
+        return cloneMeShallow(getFactory(), reversed);
     }
 
     public ColumnFamilyType getType()
@@ -123,7 +128,7 @@ public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
 
     public void addCounter(CellName name, long value)
     {
-        addColumn(new BufferCounterUpdateCell(name, value, System.currentTimeMillis()));
+        addColumn(new BufferCounterUpdateCell(name, value, FBUtilities.timestampMicros()));
     }
 
     public void addTombstone(CellName name, ByteBuffer localDeletionTime, long timestamp)
@@ -396,26 +401,42 @@ public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
 
     public ColumnStats getColumnStats()
     {
-        long minTimestampSeen = deletionInfo().isLive() ? Long.MAX_VALUE : deletionInfo().minTimestamp();
-        long maxTimestampSeen = deletionInfo().maxTimestamp();
+        // note that we default to MIN_VALUE/MAX_VALUE here to be able to override them later in this method
+        // we are checking row/range tombstones and actual cells - there should always be data that overrides
+        // these with actual values
+        ColumnStats.MinLongTracker minTimestampTracker = new ColumnStats.MinLongTracker(Long.MIN_VALUE);
+        ColumnStats.MaxLongTracker maxTimestampTracker = new ColumnStats.MaxLongTracker(Long.MAX_VALUE);
         StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
-        int maxLocalDeletionTime = Integer.MIN_VALUE;
+        ColumnStats.MaxIntTracker maxDeletionTimeTracker = new ColumnStats.MaxIntTracker(Integer.MAX_VALUE);
         List<ByteBuffer> minColumnNamesSeen = Collections.emptyList();
         List<ByteBuffer> maxColumnNamesSeen = Collections.emptyList();
         boolean hasLegacyCounterShards = false;
+
+        if (deletionInfo().getTopLevelDeletion().localDeletionTime < Integer.MAX_VALUE)
+        {
+            tombstones.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
+            maxDeletionTimeTracker.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
+            minTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
+            maxTimestampTracker.update(deletionInfo().getTopLevelDeletion().markedForDeleteAt);
+        }
+        Iterator<RangeTombstone> it = deletionInfo().rangeIterator();
+        while (it.hasNext())
+        {
+            RangeTombstone rangeTombstone = it.next();
+            tombstones.update(rangeTombstone.getLocalDeletionTime());
+            minTimestampTracker.update(rangeTombstone.timestamp());
+            maxTimestampTracker.update(rangeTombstone.timestamp());
+            maxDeletionTimeTracker.update(rangeTombstone.getLocalDeletionTime());
+            minColumnNamesSeen = ColumnNameHelper.minComponents(minColumnNamesSeen, rangeTombstone.min, metadata.comparator);
+            maxColumnNamesSeen = ColumnNameHelper.maxComponents(maxColumnNamesSeen, rangeTombstone.max, metadata.comparator);
+        }
+
         for (Cell cell : this)
         {
-            if (deletionInfo().getTopLevelDeletion().localDeletionTime < Integer.MAX_VALUE)
-                tombstones.update(deletionInfo().getTopLevelDeletion().localDeletionTime);
-            Iterator<RangeTombstone> it = deletionInfo().rangeIterator();
-            while (it.hasNext())
-            {
-                RangeTombstone rangeTombstone = it.next();
-                tombstones.update(rangeTombstone.getLocalDeletionTime());
-            }
-            minTimestampSeen = Math.min(minTimestampSeen, cell.timestamp());
-            maxTimestampSeen = Math.max(maxTimestampSeen, cell.timestamp());
-            maxLocalDeletionTime = Math.max(maxLocalDeletionTime, cell.getLocalDeletionTime());
+            minTimestampTracker.update(cell.timestamp());
+            maxTimestampTracker.update(cell.timestamp());
+            maxDeletionTimeTracker.update(cell.getLocalDeletionTime());
+
             int deletionTime = cell.getLocalDeletionTime();
             if (deletionTime < Integer.MAX_VALUE)
                 tombstones.update(deletionTime);
@@ -425,9 +446,9 @@ public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
                 hasLegacyCounterShards = hasLegacyCounterShards || ((CounterCell) cell).hasLegacyShards();
         }
         return new ColumnStats(getColumnCount(),
-                               minTimestampSeen,
-                               maxTimestampSeen,
-                               maxLocalDeletionTime,
+                               minTimestampTracker.get(),
+                               maxTimestampTracker.get(),
+                               maxDeletionTimeTracker.get(),
                                tombstones,
                                minColumnNamesSeen,
                                maxColumnNamesSeen,
@@ -497,6 +518,12 @@ public abstract class ColumnFamily implements Iterable<Cell>, IRowCacheEntry
         serializer.serialize(this, out, MessagingService.current_version);
         return ByteBuffer.wrap(out.getData(), 0, out.getLength());
     }
+
+
+    /**
+     * @return an iterator where the removes are carried out once everything has been iterated
+     */
+    public abstract BatchRemoveIterator<Cell> batchRemoveIterator();
 
     public abstract static class Factory <T extends ColumnFamily>
     {

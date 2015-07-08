@@ -94,7 +94,7 @@ public class NamesQueryFilter implements IDiskAtomFilter
         return new SSTableNamesIterator(sstable, file, key, columns, indexEntry);
     }
 
-    public void collectReducedColumns(ColumnFamily container, Iterator<Cell> reducedColumns, int gcBefore, long now)
+    public void collectReducedColumns(ColumnFamily container, Iterator<Cell> reducedColumns, DecoratedKey key, int gcBefore, long now)
     {
         DeletionInfo.InOrderTester tester = container.inOrderDeletionTester();
         while (reducedColumns.hasNext())
@@ -103,7 +103,7 @@ public class NamesQueryFilter implements IDiskAtomFilter
 
     public Comparator<Cell> getColumnComparator(CellNameType comparator)
     {
-        return comparator.columnComparator();
+        return comparator.columnComparator(false);
     }
 
     @Override

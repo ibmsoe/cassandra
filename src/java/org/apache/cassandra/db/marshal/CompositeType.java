@@ -30,7 +30,7 @@ import com.google.common.collect.ImmutableList;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.Relation;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -252,16 +252,16 @@ public class CompositeType extends AbstractCompositeType
     }
 
     @Override
-    public boolean isValueCompatibleWith(AbstractType<?> previous)
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
-        if (this == previous)
+        if (this == otherType)
             return true;
 
-        if (!(previous instanceof CompositeType))
+        if (!(otherType instanceof CompositeType))
             return false;
 
         // Extending with new components is fine
-        CompositeType cp = (CompositeType)previous;
+        CompositeType cp = (CompositeType) otherType;
         if (types.size() < cp.types.size())
             return false;
 
@@ -430,7 +430,7 @@ public class CompositeType extends AbstractCompositeType
             return bb;
         }
 
-        public ByteBuffer buildForRelation(Relation.Type op)
+        public ByteBuffer buildForRelation(Operator op)
         {
             /*
              * Given the rules for eoc (end-of-component, see AbstractCompositeType.compare()),

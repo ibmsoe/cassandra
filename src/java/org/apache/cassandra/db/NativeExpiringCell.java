@@ -128,17 +128,34 @@ public class NativeExpiringCell extends NativeCell implements ExpiringCell
         FBUtilities.updateWithInt(digest, getTimeToLive());
     }
 
-    public boolean equals(Cell cell)
+    @Override
+    public Cell reconcile(Cell cell)
     {
-        return cell instanceof ExpiringCell && equals((ExpiringCell) cell);
+        long ts1 = timestamp(), ts2 = cell.timestamp();
+        if (ts1 != ts2)
+            return ts1 < ts2 ? cell : this;
+        // we should prefer tombstones
+        if (cell instanceof DeletedCell)
+            return cell;
+        int c = value().compareTo(cell.value());
+        if (c != 0)
+            return c < 0 ? cell : this;
+        // If we have same timestamp and value, prefer the longest ttl
+        if (cell instanceof ExpiringCell)
+        {
+            int let1 = getLocalDeletionTime(), let2 = cell.getLocalDeletionTime();
+            if (let1 < let2)
+                return cell;
+        }
+        return this;
     }
 
-    protected boolean equals(ExpiringCell cell)
+    public boolean equals(Cell cell)
     {
-        // super.equals() returns false if o is not a CounterCell
-        return super.equals(cell)
-                && getLocalDeletionTime() == cell.getLocalDeletionTime()
-                && getTimeToLive() == cell.getTimeToLive();
+        if (!super.equals(cell))
+            return false;
+        ExpiringCell that = (ExpiringCell) cell;
+        return getLocalDeletionTime() == that.getLocalDeletionTime() && getTimeToLive() == that.getTimeToLive();
     }
 
     @Override
@@ -160,7 +177,7 @@ public class NativeExpiringCell extends NativeCell implements ExpiringCell
     }
 
     @Override
-    public long excessHeapSizeExcludingData()
+    public long unsharedHeapSizeExcludingData()
     {
         return SIZE;
     }

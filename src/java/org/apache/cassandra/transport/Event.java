@@ -218,6 +218,8 @@ public abstract class Event
             this.target = target;
             this.keyspace = keyspace;
             this.tableOrType = tableOrType;
+            if (target != Target.KEYSPACE)
+                assert this.tableOrType != null : "Table or type should be set for non-keyspace schema change events";
         }
 
         public SchemaChange(Change change, String keyspace)
@@ -226,7 +228,7 @@ public abstract class Event
         }
 
         // Assumes the type has already been deserialized
-        private static SchemaChange deserializeEvent(ByteBuf cb, int version)
+        public static SchemaChange deserializeEvent(ByteBuf cb, int version)
         {
             Change change = CBUtil.readEnumValue(Change.class, cb);
             if (version >= 3)
@@ -244,7 +246,7 @@ public abstract class Event
             }
         }
 
-        protected void serializeEvent(ByteBuf dest, int version)
+        public void serializeEvent(ByteBuf dest, int version)
         {
             if (version >= 3)
             {
@@ -256,13 +258,24 @@ public abstract class Event
             }
             else
             {
-                CBUtil.writeEnumValue(change, dest);
-                CBUtil.writeString(keyspace, dest);
-                CBUtil.writeString(target == Target.KEYSPACE ? "" : tableOrType, dest);
+                if (target == Target.TYPE)
+                {
+                    // For the v1/v2 protocol, we have no way to represent type changes, so we simply say the keyspace
+                    // was updated.  See CASSANDRA-7617.
+                    CBUtil.writeEnumValue(Change.UPDATED, dest);
+                    CBUtil.writeString(keyspace, dest);
+                    CBUtil.writeString("", dest);
+                }
+                else
+                {
+                    CBUtil.writeEnumValue(change, dest);
+                    CBUtil.writeString(keyspace, dest);
+                    CBUtil.writeString(target == Target.KEYSPACE ? "" : tableOrType, dest);
+                }
             }
         }
 
-        protected int eventSerializedSize(int version)
+        public int eventSerializedSize(int version)
         {
             if (version >= 3)
             {
@@ -277,6 +290,12 @@ public abstract class Event
             }
             else
             {
+                if (target == Target.TYPE)
+                {
+                    return CBUtil.sizeOfEnumValue(Change.UPDATED)
+                         + CBUtil.sizeOfString(keyspace)
+                         + CBUtil.sizeOfString("");
+                }
                 return CBUtil.sizeOfEnumValue(change)
                      + CBUtil.sizeOfString(keyspace)
                      + CBUtil.sizeOfString(target == Target.KEYSPACE ? "" : tableOrType);

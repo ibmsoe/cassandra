@@ -21,10 +21,8 @@ package org.apache.cassandra.stress.util;
  */
 
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -36,58 +34,117 @@ import java.util.concurrent.TimeUnit;
 // metrics calculated over the interval are accurate
 public class Timing
 {
+    // concurrency: this should be ok as the consumers are created serially by StressAction.run / warmup
+    // Probably the CopyOnWriteArrayList could be changed to an ordinary list as well.
+    private final Map<String, List<Timer>> timers = new TreeMap<>();
+    private volatile TimingIntervals history;
+    private final int historySampleCount;
+    private final int reportSampleCount;
+    private boolean done;
 
-    private final CopyOnWriteArrayList<Timer> timers = new CopyOnWriteArrayList<>();
-    private volatile TimingInterval history;
-    private final Random rnd = new Random();
+    public Timing(int historySampleCount, int reportSampleCount)
+    {
+        this.historySampleCount = historySampleCount;
+        this.reportSampleCount = reportSampleCount;
+    }
 
     // TIMING
 
-    private TimingInterval snapInterval(Random rnd) throws InterruptedException
+    public static class TimingResult<E>
     {
-        final Timer[] timers = this.timers.toArray(new Timer[0]);
-        final CountDownLatch ready = new CountDownLatch(timers.length);
-        for (int i = 0 ; i < timers.length ; i++)
+        public final E extra;
+        public final TimingIntervals intervals;
+        public TimingResult(E extra, TimingIntervals intervals)
         {
-            final Timer timer = timers[i];
-            timer.requestReport(ready);
+            this.extra = extra;
+            this.intervals = intervals;
+        }
+    }
+
+    public <E> TimingResult<E> snap(Callable<E> call) throws InterruptedException
+    {
+        // Count up total # of timers
+        int timerCount = 0;
+        for (List<Timer> timersForOperation : timers.values())
+        {
+            timerCount += timersForOperation.size();
+        }
+        final CountDownLatch ready = new CountDownLatch(timerCount);
+
+        // request reports
+        for (List <Timer> timersForOperation : timers.values())
+        {
+            for(Timer timer : timersForOperation)
+            {
+                timer.requestReport(ready);
+            }
+        }
+
+        E extra;
+        try
+        {
+            extra = call.call();
+        }
+        catch (Exception e)
+        {
+            if (e instanceof InterruptedException)
+                throw (InterruptedException) e;
+            throw new RuntimeException(e);
         }
 
         // TODO fail gracefully after timeout if a thread is stuck
-        if (!ready.await(2L, TimeUnit.MINUTES))
-            throw new RuntimeException("Timed out waiting for a timer thread - seems one got stuck");
+        if (!ready.await(5L, TimeUnit.MINUTES))
+        {
+            throw new RuntimeException("Timed out waiting for a timer thread - seems one got stuck. Check GC/Heap size");
+        }
+
+        boolean done = true;
 
         // reports have been filled in by timer threadCount, so merge
-        List<TimingInterval> intervals = new ArrayList<>();
-        for (Timer timer : timers)
-            intervals.add(timer.report);
+        Map<String, TimingInterval> intervals = new TreeMap<>();
+        for (Map.Entry<String, List<Timer>> entry : timers.entrySet())
+        {
+            List<TimingInterval> operationIntervals = new ArrayList<>();
+            for (Timer timer : entry.getValue())
+            {
+                operationIntervals.add(timer.report);
+                done &= !timer.running();
+            }
 
-        return TimingInterval.merge(rnd, intervals, Integer.MAX_VALUE, history.endNanos());
+            intervals.put(entry.getKey(), TimingInterval.merge(operationIntervals, reportSampleCount,
+                                                              history.get(entry.getKey()).endNanos()));
+        }
+
+        TimingIntervals result = new TimingIntervals(intervals);
+        this.done = done;
+        history = history.merge(result, historySampleCount, history.startNanos());
+        return new TimingResult<>(extra, result);
     }
 
-    // build a new timer and add it to the set of running timers
-    public Timer newTimer()
+    // build a new timer and add it to the set of running timers.
+    public Timer newTimer(String opType, int sampleCount)
     {
-        final Timer timer = new Timer();
-        timers.add(timer);
+        final Timer timer = new Timer(sampleCount);
+
+        if (!timers.containsKey(opType))
+            timers.put(opType, new ArrayList<Timer>());
+
+        timers.get(opType).add(timer);
         return timer;
     }
 
     public void start()
     {
-        history = new TimingInterval(System.nanoTime());
+        history = new TimingIntervals(timers.keySet());
     }
 
-    public TimingInterval snapInterval() throws InterruptedException
+    public boolean done()
     {
-        final TimingInterval interval = snapInterval(rnd);
-        history = TimingInterval.merge(rnd, Arrays.asList(interval, history), 50000, history.startNanos());
-        return interval;
+        return done;
     }
 
-    public TimingInterval getHistory()
+    public TimingIntervals getHistory()
     {
         return history;
     }
-
 }

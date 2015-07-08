@@ -29,7 +29,6 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
-import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,7 +43,6 @@ import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
 import org.apache.cassandra.db.compaction.CompactionHistoryTabularData;
 import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.composites.Composite;
-import org.apache.cassandra.db.composites.Composites;
 import org.apache.cassandra.db.filter.QueryFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.Range;
@@ -73,7 +71,6 @@ public class SystemKeyspace
     public static final String PEER_EVENTS_CF = "peer_events";
     public static final String LOCAL_CF = "local";
     public static final String INDEX_CF = "IndexInfo";
-    public static final String COUNTER_ID_CF = "NodeIdInfo";
     public static final String HINTS_CF = "hints";
     public static final String RANGE_XFERS_CF = "range_xfers";
     public static final String BATCHLOG_CF = "batchlog";
@@ -87,9 +84,9 @@ public class SystemKeyspace
     public static final String PAXOS_CF = "paxos";
     public static final String SSTABLE_ACTIVITY_CF = "sstable_activity";
     public static final String COMPACTION_HISTORY_CF = "compaction_history";
+    public static final String SIZE_ESTIMATES_CF = "size_estimates";
 
     private static final String LOCAL_KEY = "local";
-    private static final ByteBuffer ALL_LOCAL_NODE_ID_KEY = ByteBufferUtil.bytes("Local");
 
     public static final List<String> allSchemaCfs = Arrays.asList(SCHEMA_KEYSPACES_CF,
                                                                   SCHEMA_COLUMNFAMILIES_CF,
@@ -118,22 +115,29 @@ public class SystemKeyspace
         migrateIndexInterval();
         migrateCachingOption();
         // add entries to system schema columnfamilies for the hardcoded system definitions
-        for (String ksname : Schema.systemKeyspaceNames)
+        KSMetaData ksmd = Schema.instance.getKSMetaData(Keyspace.SYSTEM_KS);
+
+        long timestamp = FBUtilities.timestampMicros();
+
+        // delete old, possibly obsolete entries in schema columnfamilies
+        for (String cfname : Arrays.asList(SystemKeyspace.SCHEMA_KEYSPACES_CF,
+                                           SystemKeyspace.SCHEMA_COLUMNFAMILIES_CF,
+                                           SystemKeyspace.SCHEMA_COLUMNS_CF,
+                                           SystemKeyspace.SCHEMA_TRIGGERS_CF,
+                                           SystemKeyspace.SCHEMA_USER_TYPES_CF))
         {
-            KSMetaData ksmd = Schema.instance.getKSMetaData(ksname);
-
-            // delete old, possibly obsolete entries in schema columnfamilies
-            for (String cfname : Arrays.asList(SystemKeyspace.SCHEMA_KEYSPACES_CF, SystemKeyspace.SCHEMA_COLUMNFAMILIES_CF, SystemKeyspace.SCHEMA_COLUMNS_CF))
-                executeOnceInternal(String.format("DELETE FROM system.%s WHERE keyspace_name = ?", cfname), ksmd.name);
-
-            // (+1 to timestamp to make sure we don't get shadowed by the tombstones we just added)
-            ksmd.toSchema(FBUtilities.timestampMicros() + 1).apply();
+            executeOnceInternal(String.format("DELETE FROM system.%s USING TIMESTAMP ? WHERE keyspace_name = ?", cfname),
+                                timestamp,
+                                ksmd.name);
         }
+
+        // (+1 to timestamp to make sure we don't get shadowed by the tombstones we just added)
+        ksmd.toSchema(timestamp + 1).apply();
     }
 
     private static void setupVersion()
     {
-        String req = "INSERT INTO system.%s (key, release_version, cql_version, thrift_version, native_protocol_version, data_center, rack, partitioner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        String req = "INSERT INTO system.%s (key, release_version, cql_version, thrift_version, native_protocol_version, data_center, rack, partitioner, rpc_address, broadcast_address, listen_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
         executeOnceInternal(String.format(req, LOCAL_CF),
                             LOCAL_KEY,
@@ -143,7 +147,10 @@ public class SystemKeyspace
                             String.valueOf(Server.CURRENT_VERSION),
                             snitch.getDatacenter(FBUtilities.getBroadcastAddress()),
                             snitch.getRack(FBUtilities.getBroadcastAddress()),
-                            DatabaseDescriptor.getPartitioner().getClass().getName());
+                            DatabaseDescriptor.getPartitioner().getClass().getName(),
+                            DatabaseDescriptor.getRpcAddress(),
+                            FBUtilities.getBroadcastAddress(),
+                            FBUtilities.getLocalAddress());
     }
 
     // TODO: In 3.0, remove this and the index_interval column from system.schema_columnfamilies
@@ -512,13 +519,19 @@ public class SystemKeyspace
         return hostIdMap;
     }
 
+    /**
+     * Get preferred IP for given endpoint if it is known. Otherwise this returns given endpoint itself.
+     *
+     * @param ep endpoint address to check
+     * @return Preferred IP for given endpoint if present, otherwise returns given ep
+     */
     public static InetAddress getPreferredIP(InetAddress ep)
     {
         String req = "SELECT preferred_ip FROM system.%s WHERE peer=?";
         UntypedResultSet result = executeInternal(String.format(req, PEERS_CF), ep);
         if (!result.isEmpty() && result.one().has("preferred_ip"))
             return result.one().getInetAddress("preferred_ip");
-        return null;
+        return ep;
     }
 
     /**
@@ -539,6 +552,37 @@ public class SystemKeyspace
             }
         }
         return result;
+    }
+
+    /**
+     * Get release version for given endpoint.
+     * If release version is unknown, then this returns null.
+     *
+     * @param ep endpoint address to check
+     * @return Release version or null if version is unknown.
+     */
+    public static SemanticVersion getReleaseVersion(InetAddress ep)
+    {
+        try
+        {
+            if (FBUtilities.getBroadcastAddress().equals(ep))
+            {
+                return new SemanticVersion(FBUtilities.getReleaseVersionString());
+            }
+            String req = "SELECT release_version FROM system.%s WHERE peer=?";
+            UntypedResultSet result = executeInternal(String.format(req, PEERS_CF), ep);
+            if (result != null && result.one().has("release_version"))
+            {
+                return new SemanticVersion(result.one().getString("release_version"));
+            }
+            // version is unknown
+            return null;
+        }
+        catch (IllegalArgumentException e)
+        {
+            // version string cannot be parsed
+            return null;
+        }
     }
 
     /**
@@ -673,6 +717,7 @@ public class SystemKeyspace
         ColumnFamily cf = ArrayBackedSortedColumns.factory.create(Keyspace.SYSTEM_KS, INDEX_CF);
         cf.addColumn(new BufferCell(cf.getComparator().makeCellName(indexName), ByteBufferUtil.EMPTY_BYTE_BUFFER, FBUtilities.timestampMicros()));
         new Mutation(Keyspace.SYSTEM_KS, ByteBufferUtil.bytes(keyspaceName), cf).apply();
+        forceBlockingFlush(INDEX_CF);
     }
 
     public static void setIndexRemoved(String keyspaceName, String indexName)
@@ -688,19 +733,15 @@ public class SystemKeyspace
      */
     public static UUID getLocalHostId()
     {
-        UUID hostId = null;
-
         String req = "SELECT host_id FROM system.%s WHERE key='%s'";
         UntypedResultSet result = executeInternal(String.format(req, LOCAL_CF, LOCAL_KEY));
 
         // Look up the Host UUID (return it if found)
         if (!result.isEmpty() && result.one().has("host_id"))
-        {
             return result.one().getUUID("host_id");
-        }
 
         // ID not found, generate a new one, persist, and then return it.
-        hostId = UUID.randomUUID();
+        UUID hostId = UUID.randomUUID();
         logger.warn("No host ID found, created {} (Note: This should happen exactly once per node).", hostId);
         return setLocalHostId(hostId);
     }
@@ -713,45 +754,6 @@ public class SystemKeyspace
         String req = "INSERT INTO system.%s (key, host_id) VALUES ('%s', ?)";
         executeInternal(String.format(req, LOCAL_CF, LOCAL_KEY), hostId);
         return hostId;
-    }
-
-    /**
-     * Read the current local node id from the system keyspace or null if no
-     * such node id is recorded.
-     */
-    public static CounterId getCurrentLocalCounterId()
-    {
-        Keyspace keyspace = Keyspace.open(Keyspace.SYSTEM_KS);
-
-        // Get the last CounterId (since CounterId are timeuuid is thus ordered from the older to the newer one)
-        QueryFilter filter = QueryFilter.getSliceFilter(decorate(ALL_LOCAL_NODE_ID_KEY),
-                                                        COUNTER_ID_CF,
-                                                        Composites.EMPTY,
-                                                        Composites.EMPTY,
-                                                        true,
-                                                        1,
-                                                        System.currentTimeMillis());
-        ColumnFamily cf = keyspace.getColumnFamilyStore(COUNTER_ID_CF).getColumnFamily(filter);
-        if (cf != null && cf.hasColumns())
-            return CounterId.wrap(cf.iterator().next().name().toByteBuffer());
-        else
-            return null;
-    }
-
-    /**
-     * Write a new current local node id to the system keyspace.
-     *
-     * @param newCounterId the new current local node id to record
-     * @param now microsecond time stamp.
-     */
-    public static void writeCurrentLocalCounterId(CounterId newCounterId, long now)
-    {
-        ByteBuffer ip = ByteBuffer.wrap(FBUtilities.getBroadcastAddress().getAddress());
-
-        ColumnFamily cf = ArrayBackedSortedColumns.factory.create(Keyspace.SYSTEM_KS, COUNTER_ID_CF);
-        cf.addColumn(new BufferCell(cf.getComparator().makeCellName(newCounterId.bytes()), ip, now));
-        new Mutation(Keyspace.SYSTEM_KS, ALL_LOCAL_NODE_ID_KEY, cf).apply();
-        forceBlockingFlush(COUNTER_ID_CF);
     }
 
     /**
@@ -816,12 +818,16 @@ public class SystemKeyspace
         }
     }
 
-    public static Map<DecoratedKey, ColumnFamily> getSchema(String cfName)
+    public static Map<DecoratedKey, ColumnFamily> getSchema(String schemaCfName, Set<String> keyspaces)
     {
-        Map<DecoratedKey, ColumnFamily> schema = new HashMap<DecoratedKey, ColumnFamily>();
+        Map<DecoratedKey, ColumnFamily> schema = new HashMap<>();
 
-        for (Row schemaEntity : SystemKeyspace.serializedSchema(cfName))
-            schema.put(schemaEntity.key, schemaEntity.cf);
+        for (String keyspace : keyspaces)
+        {
+            Row schemaEntity = readSchemaRow(schemaCfName, keyspace);
+            if (schemaEntity.cf != null)
+                schema.put(schemaEntity.key, schemaEntity.cf);
+        }
 
         return schema;
     }
@@ -831,12 +837,19 @@ public class SystemKeyspace
         return AsciiType.instance.fromString(ksName);
     }
 
-    public static Row readSchemaRow(String ksName)
+    /**
+     * Fetches a subset of schema (table data, columns metadata or triggers) for the keyspace.
+     *
+     * @param schemaCfName the schema table to get the data from (schema_keyspaces, schema_columnfamilies, schema_columns or schema_triggers)
+     * @param ksName the keyspace of the tables we are interested in
+     * @return a Row containing the schema data of a particular type for the keyspace
+     */
+    public static Row readSchemaRow(String schemaCfName, String ksName)
     {
         DecoratedKey key = StorageService.getPartitioner().decorateKey(getSchemaKSKey(ksName));
 
-        ColumnFamilyStore schemaCFS = SystemKeyspace.schemaCFS(SCHEMA_KEYSPACES_CF);
-        ColumnFamily result = schemaCFS.getColumnFamily(QueryFilter.getIdentityFilter(key, SCHEMA_KEYSPACES_CF, System.currentTimeMillis()));
+        ColumnFamilyStore schemaCFS = SystemKeyspace.schemaCFS(schemaCfName);
+        ColumnFamily result = schemaCFS.getColumnFamily(QueryFilter.getIdentityFilter(key, schemaCfName, System.currentTimeMillis()));
 
         return new Row(key, result);
     }
@@ -969,5 +982,46 @@ public class SystemKeyspace
     {
         String cql = "DELETE FROM system.%s WHERE keyspace_name=? AND columnfamily_name=? and generation=?";
         executeInternal(String.format(cql, SSTABLE_ACTIVITY_CF), keyspace, table, generation);
+    }
+
+    /**
+     * Writes the current partition count and size estimates into SIZE_ESTIMATES_CF
+     */
+    public static void updateSizeEstimates(String keyspace, String table, Map<Range<Token>, Pair<Long, Long>> estimates)
+    {
+        long timestamp = FBUtilities.timestampMicros();
+        CFMetaData estimatesTable = CFMetaData.SizeEstimatesCf;
+        Mutation mutation = new Mutation(Keyspace.SYSTEM_KS, UTF8Type.instance.decompose(keyspace));
+
+        // delete all previous values with a single range tombstone.
+        mutation.deleteRange(SIZE_ESTIMATES_CF,
+                             estimatesTable.comparator.make(table).start(),
+                             estimatesTable.comparator.make(table).end(),
+                             timestamp - 1);
+
+        // add a CQL row for each primary token range.
+        ColumnFamily cells = mutation.addOrGet(estimatesTable);
+        for (Map.Entry<Range<Token>, Pair<Long, Long>> entry : estimates.entrySet())
+        {
+            Range<Token> range = entry.getKey();
+            Pair<Long, Long> values = entry.getValue();
+            Composite prefix = estimatesTable.comparator.make(table, range.left.toString(), range.right.toString());
+            CFRowAdder adder = new CFRowAdder(cells, prefix, timestamp);
+            adder.add("partitions_count", values.left)
+                 .add("mean_partition_size", values.right);
+        }
+
+        mutation.apply();
+    }
+
+    /**
+     * Clears size estimates for a table (on table drop)
+     */
+    public static void clearSizeEstimates(String keyspace, String table)
+    {
+        String cql = String.format("DELETE FROM %s.%s WHERE keyspace_name = ? AND table_name = ?",
+                                   Keyspace.SYSTEM_KS,
+                                   SIZE_ESTIMATES_CF);
+        executeInternal(cql, keyspace, table);
     }
 }

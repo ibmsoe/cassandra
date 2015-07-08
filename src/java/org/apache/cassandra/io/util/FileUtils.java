@@ -33,10 +33,12 @@ import java.nio.file.StandardCopyOption;
 import java.text.DecimalFormat;
 import java.util.Arrays;
 
+import sun.nio.ch.DirectBuffer;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.Config;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BlacklistedDirectories;
 import org.apache.cassandra.db.Keyspace;
@@ -45,7 +47,7 @@ import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.service.StorageService;
-import sun.nio.ch.DirectBuffer;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 public class FileUtils
 {
@@ -69,6 +71,7 @@ public class FileUtils
         }
         catch (Throwable t)
         {
+            JVMStabilityInspector.inspectThrowable(t);
             logger.info("Cannot initialize un-mmaper.  (Are you using a non-Oracle JVM?)  Compacted data files will not be removed promptly.  Consider using an Oracle JVM or using standard disk access mode");
         }
         canCleanDirectBuffers = canClean;
@@ -323,7 +326,7 @@ public class FileUtils
                 deleteWithConfirm(new File(file));
             }
         };
-        StorageService.tasks.execute(runnable);
+        ScheduledExecutors.nonPeriodicTasks.execute(runnable);
     }
 
     public static String stringifyFileSize(double value)
@@ -390,27 +393,20 @@ public class FileUtils
         }
     }
 
-    public static void skipBytesFully(DataInput in, long bytes) throws IOException
-    {
-        long n = 0;
-        while (n < bytes)
-        {
-            int m = (int) Math.min(Integer.MAX_VALUE, bytes - n);
-            int skipped = in.skipBytes(m);
-            if (skipped == 0)
-                throw new EOFException("EOF after " + n + " bytes out of " + bytes);
-            n += skipped;
-        }
-    }
-
     public static void handleCorruptSSTable(CorruptSSTableException e)
     {
-        if (DatabaseDescriptor.getDiskFailurePolicy() == Config.DiskFailurePolicy.stop_paranoid)
-            StorageService.instance.stopTransports();
+        JVMStabilityInspector.inspectThrowable(e);
+        switch (DatabaseDescriptor.getDiskFailurePolicy())
+        {
+            case stop_paranoid:
+                StorageService.instance.stopTransports();
+                break;
+        }
     }
     
     public static void handleFSError(FSError e)
     {
+        JVMStabilityInspector.inspectThrowable(e);
         switch (DatabaseDescriptor.getDiskFailurePolicy())
         {
             case stop_paranoid:

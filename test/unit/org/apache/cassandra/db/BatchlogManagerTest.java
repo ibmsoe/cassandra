@@ -68,13 +68,14 @@ public class BatchlogManagerTest extends SchemaLoader
             Mutation mutation = new Mutation("Keyspace1", bytes(i));
             mutation.add("Standard1", comparator.makeCellName(bytes(i)), bytes(i), System.currentTimeMillis());
 
-            long timestamp = System.currentTimeMillis();
-            if (i < 500)
-                timestamp -= DatabaseDescriptor.getWriteRpcTimeout() * 2;
+            long timestamp = i < 500
+                           ? (System.currentTimeMillis() - DatabaseDescriptor.getWriteRpcTimeout() * 2) * 1000
+                           : Long.MAX_VALUE;
+
             BatchlogManager.getBatchlogMutationFor(Collections.singleton(mutation),
                                                    UUIDGen.getTimeUUID(),
                                                    MessagingService.current_version,
-                                                   timestamp * 1000)
+                                                   timestamp)
                            .apply();
         }
 
@@ -84,8 +85,8 @@ public class BatchlogManagerTest extends SchemaLoader
         assertEquals(1000, BatchlogManager.instance.countAllBatches() - initialAllBatches);
         assertEquals(0, BatchlogManager.instance.getTotalBatchesReplayed() - initialReplayedBatches);
 
-        // Force batchlog replay.
-        BatchlogManager.instance.replayAllFailedBatches();
+        // Force batchlog replay and wait for it to complete.
+        BatchlogManager.instance.startBatchlogReplay().get();
 
         // Ensure that the first half, and only the first half, got replayed.
         assertEquals(500, BatchlogManager.instance.countAllBatches() - initialAllBatches);
@@ -151,8 +152,8 @@ public class BatchlogManagerTest extends SchemaLoader
         // Flush the batchlog to disk (see CASSANDRA-6822).
         Keyspace.open(Keyspace.SYSTEM_KS).getColumnFamilyStore(SystemKeyspace.BATCHLOG_CF).forceFlush();
 
-        // Force batchlog replay.
-        BatchlogManager.instance.replayAllFailedBatches();
+        // Force batchlog replay and wait for it to complete.
+        BatchlogManager.instance.startBatchlogReplay().get();
 
         // We should see half of Standard2-targeted mutations written after the replay and all of Standard3 mutations applied.
         for (int i = 0; i < 1000; i++)

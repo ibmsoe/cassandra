@@ -55,7 +55,7 @@ public class ColumnSlice
 
     public boolean includes(Comparator<Composite> cmp, Composite name)
     {
-        return cmp.compare(start, name) <= 0 && (finish.isEmpty() || cmp.compare(finish, name) >= 0);
+        return (start.isEmpty() || cmp.compare(start, name) <= 0) && (finish.isEmpty() || cmp.compare(finish, name) >= 0);
     }
 
     public boolean isBefore(Comparator<Composite> cmp, Composite name)
@@ -65,8 +65,6 @@ public class ColumnSlice
 
     public boolean intersects(List<ByteBuffer> minCellNames, List<ByteBuffer> maxCellNames, CellNameType comparator, boolean reversed)
     {
-        assert minCellNames.size() == maxCellNames.size();
-
         Composite sStart = reversed ? finish : start;
         Composite sEnd = reversed ? start : finish;
 
@@ -76,7 +74,7 @@ public class ColumnSlice
         // We could safely return true here, but there's a minor optimization: if the first component is restricted
         // to a single value, we can check that the second component falls within the min/max for that component
         // (and repeat for all components).
-        for (int i = 0; i < minCellNames.size(); i++)
+        for (int i = 0; i < minCellNames.size() && i < maxCellNames.size(); i++)
         {
             AbstractType<?> t = comparator.subtype(i);
             ByteBuffer s = i < sStart.size() ? sStart.get(i) : ByteBufferUtil.EMPTY_BYTE_BUFFER;
@@ -101,12 +99,29 @@ public class ColumnSlice
         for (int i = 0; i < sstableBounds.size(); i++)
         {
             if (i >= sliceBounds.size())
+            {
+                // When isSliceStart is true, we're comparing the end of the slice against the min cell name for the sstable,
+                // so the slice is something like [(1, 0), (1, 0)], and the sstable max is something like (1, 0, 1).
+                // We want to return -1 (slice start is smaller than max column name) so that we say the slice intersects.
+                // The opposite is true when dealing with the end slice.  For example, with the same slice and a min
+                // cell name of (1, 0, 1), we want to return 1 (slice end is bigger than min column name).
                 return isSliceStart ? -1 : 1;
+            }
 
             int comparison = comparator.subtype(i).compare(sliceBounds.get(i), sstableBounds.get(i));
             if (comparison != 0)
                 return comparison;
         }
+
+        // the slice bound and sstable bound have been equal in all components so far
+        if (sliceBounds.size() > sstableBounds.size())
+        {
+            // We have the opposite situation from the one described above.  With a slice of [(1, 0), (1, 0)],
+            // and a min/max cell name of (1), we want to say the slice start is smaller than the max and the slice
+            // end is larger than the min.
+            return isSliceStart ? -1 : 1;
+        }
+
         return 0;
     }
 
@@ -114,26 +129,32 @@ public class ColumnSlice
      * Validates that the provided slice array contains only non-overlapped slices valid for a query {@code reversed}
      * or not on a table using {@code comparator}.
      */
-    public static boolean validateSlices(ColumnSlice[] slices, CellNameType comparator, boolean reversed)
+    public static boolean validateSlices(ColumnSlice[] slices, CellNameType type, boolean reversed)
     {
-        return validateSlices(slices, reversed ? comparator.reverseComparator() : comparator);
-    }
+        Comparator<Composite> comparator = reversed ? type.reverseComparator() : type;
 
-    /**
-     * Validates that the provided slice array contains only non-overlapped slices in {@code comparator} order.
-     */
-    public static boolean validateSlices(ColumnSlice[] slices, Comparator<Composite> comparator)
-    {
         for (int i = 0; i < slices.length; i++)
         {
-            if (i > 0 && comparator.compare(slices[i-1].finish, slices[i].start) >= 0)
-                return false;
+            Composite start = slices[i].start;
+            Composite finish = slices[i].finish;
 
-            if (slices[i].finish.isEmpty())
-                return i == slices.length - 1;
+            if (start.isEmpty() || finish.isEmpty())
+            {
+                if (start.isEmpty() && i > 0)
+                    return false;
 
-            if (comparator.compare(slices[i].start, slices[i].finish) > 0)
-                return false;
+                if (finish.isEmpty())
+                    return i == slices.length - 1;
+            }
+            else
+            {
+                // !finish.isEmpty() is imposed by prior loop
+                if (i > 0 && comparator.compare(slices[i - 1].finish, start) >= 0)
+                    return false;
+
+                if (comparator.compare(start, finish) > 0)
+                    return false;
+            }
         }
         return true;
     }
@@ -159,13 +180,21 @@ public class ColumnSlice
             @Override
             public int compare(ColumnSlice s1, ColumnSlice s2)
             {
-                int c = comparator.compare(s1.start, s2.start);
-                if (c != 0)
-                    return c;
+                if (s1.start.isEmpty() || s2.start.isEmpty())
+                {
+                    if (s1.start.isEmpty() != s2.start.isEmpty())
+                        return s1.start.isEmpty() ? -1 : 1;
+                }
+                else
+                {
+                    int c = comparator.compare(s1.start, s2.start);
+                    if (c != 0)
+                        return c;
+                }
 
                 // For the finish, empty always means greater
                 return s1.finish.isEmpty() || s2.finish.isEmpty()
-                     ? s1.finish.isEmpty() ? 1 : s2.finish.isEmpty() ? -1 : 0
+                     ? (s1.finish.isEmpty() ? 1 : -1)
                      : comparator.compare(s1.finish, s2.finish);
             }
         });

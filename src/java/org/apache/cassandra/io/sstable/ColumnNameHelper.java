@@ -64,7 +64,7 @@ public class ColumnNameHelper
     {
         // For a cell name, no reason to look more than the clustering prefix
         // (and comparing the collection element would actually crash)
-        int size = candidate instanceof CellName ? ((CellName)candidate).clusteringSize() : candidate.size();
+        int size = Math.min(candidate.size(), comparator.clusteringPrefixSize());
 
         if (maxSeen.isEmpty())
             return getComponents(candidate, size);
@@ -92,7 +92,7 @@ public class ColumnNameHelper
     {
         // For a cell name, no reason to look more than the clustering prefix
         // (and comparing the collection element would actually crash)
-        int size = candidate instanceof CellName ? ((CellName)candidate).clusteringSize() : candidate.size();
+        int size = Math.min(candidate.size(), comparator.clusteringPrefixSize());
 
         if (minSeen.isEmpty())
             return getComponents(candidate, size);
@@ -216,5 +216,27 @@ public class ColumnNameHelper
             retList.set(i, minimalBufferFor(max(retList.get(i), biggest.get(i), comparator.subtype(i))));
 
         return retList;
+    }
+
+    /**
+     * Checks if the given min/max column names could overlap (i.e they could share some column names based on the max/min column names in the sstables)
+     */
+    public static boolean overlaps(List<ByteBuffer> minColumnNames1, List<ByteBuffer> maxColumnNames1, List<ByteBuffer> minColumnNames2, List<ByteBuffer> maxColumnNames2, CellNameType comparator)
+    {
+        if (minColumnNames1.isEmpty() || maxColumnNames1.isEmpty() || minColumnNames2.isEmpty() || maxColumnNames2.isEmpty())
+            return true;
+
+        return !(compare(maxColumnNames1, minColumnNames2, comparator) < 0 || compare(minColumnNames1, maxColumnNames2, comparator) > 0);
+    }
+
+    private static int compare(List<ByteBuffer> columnNames1, List<ByteBuffer> columnNames2, CellNameType comparator)
+    {
+        for (int i = 0; i < Math.min(columnNames1.size(), columnNames2.size()); i++)
+        {
+            int cmp = comparator.subtype(i).compare(columnNames1.get(i), columnNames2.get(i));
+            if (cmp != 0)
+                return cmp;
+        }
+        return 0;
     }
 }

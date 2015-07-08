@@ -18,18 +18,18 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import com.google.common.base.Objects;
+
+import org.apache.cassandra.exceptions.InvalidRequestException;
 
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.Pair;
 
 /**
  * This is essentially like a CompositeType, but it's not primarily meant for comparison, just
@@ -41,12 +41,17 @@ public class TupleType extends AbstractType<ByteBuffer>
 
     public TupleType(List<AbstractType<?>> types)
     {
+        for (int i = 0; i < types.size(); i++)
+            types.set(i, types.get(i).freeze());
         this.types = types;
     }
 
     public static TupleType getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
     {
-        return new TupleType(parser.getTypeParameters());
+        List<AbstractType<?>> types = parser.getTypeParameters();
+        for (int i = 0; i < types.size(); i++)
+            types.set(i, types.get(i).freeze());
+        return new TupleType(types);
     }
 
     public AbstractType<?> type(int i)
@@ -72,8 +77,7 @@ public class TupleType extends AbstractType<ByteBuffer>
         ByteBuffer bb1 = o1.duplicate();
         ByteBuffer bb2 = o2.duplicate();
 
-        int i = 0;
-        while (bb1.remaining() > 0 && bb2.remaining() > 0)
+        for (int i = 0; bb1.remaining() > 0 && bb2.remaining() > 0; i++)
         {
             AbstractType<?> comparator = types.get(i);
 
@@ -95,8 +99,6 @@ public class TupleType extends AbstractType<ByteBuffer>
             int cmp = comparator.compare(value1, value2);
             if (cmp != 0)
                 return cmp;
-
-            ++i;
         }
 
         if (bb1.remaining() == 0)
@@ -210,6 +212,11 @@ public class TupleType extends AbstractType<ByteBuffer>
     {
         // Split the input on non-escaped ':' characters
         List<String> fieldStrings = AbstractCompositeType.split(source);
+
+        if (fieldStrings.size() > size())
+            throw new MarshalException(String.format("Invalid tuple literal: too many elements. Type %s expects %d but got %d",
+                                                     asCQL3Type(), size(), fieldStrings.size()));
+
         ByteBuffer[] fields = new ByteBuffer[fieldStrings.size()];
         for (int i = 0; i < fieldStrings.size(); i++)
         {
@@ -251,13 +258,13 @@ public class TupleType extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public boolean isValueCompatibleWith(AbstractType<?> previous)
+    public boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
     {
-        if (!(previous instanceof TupleType))
+        if (!(otherType instanceof TupleType))
             return false;
 
         // Extending with new components is fine, removing is not
-        TupleType tt = (TupleType)previous;
+        TupleType tt = (TupleType) otherType;
         if (size() < tt.size())
             return false;
 
@@ -296,6 +303,6 @@ public class TupleType extends AbstractType<ByteBuffer>
     @Override
     public String toString()
     {
-        return getClass().getName() + TypeParser.stringifyTypeParameters(types);
+        return getClass().getName() + TypeParser.stringifyTypeParameters(types, true);
     }
 }

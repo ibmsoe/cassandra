@@ -18,6 +18,7 @@
 package org.apache.cassandra.db.index;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -33,6 +34,7 @@ import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Future;
 
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +52,7 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.composites.CellName;
 import org.apache.cassandra.db.filter.ExtendedFilter;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.utils.FBUtilities;
@@ -153,8 +156,9 @@ public class SecondaryIndexManager
      */
     public void maybeBuildSecondaryIndexes(Collection<SSTableReader> sstables, Set<String> idxNames)
     {
+        idxNames = filterByColumn(idxNames);
         if (idxNames.isEmpty())
-            return;
+            return;        
 
         logger.info(String.format("Submitting index build of %s for data in %s",
                                   idxNames, StringUtils.join(sstables, ", ")));
@@ -213,24 +217,18 @@ public class SecondaryIndexManager
     }
 
     /**
-     * @return true if the indexes can handle the clause.
+     * @return true if at least one of the indexes can handle the clause.
      */
     public boolean hasIndexFor(List<IndexExpression> clause)
     {
         if (clause == null || clause.isEmpty())
             return false;
 
-        // It doesn't seem a clause can have multiple searchers, but since
-        // getIndexSearchersForQuery returns a list ...
-        List<SecondaryIndexSearcher> searchers = getIndexSearchersForQuery(clause);
-        if (searchers.isEmpty())
-            return false;
+        for (SecondaryIndexSearcher searcher : getIndexSearchersForQuery(clause))
+            if (searcher.canHandleIndexClause(clause))
+                return true;
 
-        for (SecondaryIndexSearcher searcher : searchers)
-            if (!searcher.isIndexing(clause))
-                return false;
-
-        return true;
+        return false;
     }
 
     /**
@@ -461,7 +459,7 @@ public class SecondaryIndexManager
             else
             {
                 for (Cell cell : cf)
-                    if (index.indexes(cell.name()))
+                    if (cell.isLive() && index.indexes(cell.name()))
                         ((PerColumnSecondaryIndex) index).insert(key, cell, opGroup);
             }
         }
@@ -480,23 +478,19 @@ public class SecondaryIndexManager
 
         for (Cell cell : indexedColumnsInRow)
         {
-            // TODO: this is probably incorrect, we should pull all indexes
-            ColumnDefinition cDef = baseCfs.metadata.getColumnDefinition(cell.name());
-            SecondaryIndex index = indexesByColumn.get(cDef.name.bytes);
-            if (index == null)
-                continue;
-
-            if (index instanceof PerRowSecondaryIndex)
+            for (SecondaryIndex index : indexFor(cell.name()))
             {
-                if (cleanedRowLevelIndexes == null)
-                    cleanedRowLevelIndexes = new HashSet<>();
-
-                if (cleanedRowLevelIndexes.add(index.getClass()))
-                    ((PerRowSecondaryIndex)index).delete(key, opGroup);
-            }
-            else
-            {
-                ((PerColumnSecondaryIndex) index).delete(key.getKey(), cell, opGroup);
+                if (index instanceof PerRowSecondaryIndex)
+                {
+                    if (cleanedRowLevelIndexes == null)
+                        cleanedRowLevelIndexes = new HashSet<>();
+                    if (cleanedRowLevelIndexes.add(index.getClass()))
+                        ((PerRowSecondaryIndex) index).delete(key, opGroup);
+                }
+                else
+                {
+                    ((PerColumnSecondaryIndex) index).deleteForCleanup(key.getKey(), cell, opGroup);
+                }
             }
         }
     }
@@ -513,14 +507,6 @@ public class SecondaryIndexManager
         return (indexesByColumn.isEmpty() && rowLevelIndexMap.isEmpty())
                 ? nullUpdater
                 : new StandardUpdater(key, cf, opGroup);
-    }
-
-    /**
-     * Updated closure with only the modified row key.
-     */
-    public Updater updaterFor(DecoratedKey key, OpOrder.Group opGroup)
-    {
-        return updaterFor(key, null, opGroup);
     }
 
     /**
@@ -545,15 +531,15 @@ public class SecondaryIndexManager
         {
             SecondaryIndex index = getIndexForColumn(ix.column);
 
-            if (index == null)
+            if (index == null || !index.supportsOperator(ix.operator))
                 continue;
 
-            Set<ByteBuffer> columns = groupByIndexType.get(index.getClass().getCanonicalName());
+            Set<ByteBuffer> columns = groupByIndexType.get(index.indexTypeForGrouping());
 
             if (columns == null)
             {
                 columns = new HashSet<>();
-                groupByIndexType.put(index.getClass().getCanonicalName(), columns);
+                groupByIndexType.put(index.indexTypeForGrouping(), columns);
             }
 
             columns.add(ix.column);
@@ -569,24 +555,94 @@ public class SecondaryIndexManager
     }
 
     /**
+     * Validates an union of expression index types. It will throw a {@link RuntimeException} if
+     * any of the expressions in the provided clause is not valid for its index implementation.
+     * @param clause the query clause
+     * @throws org.apache.cassandra.exceptions.InvalidRequestException in case of validation errors
+     */
+    public void validateIndexSearchersForQuery(List<IndexExpression> clause) throws InvalidRequestException
+    {
+        // Group by index type
+        Map<String, Set<IndexExpression>> expressionsByIndexType = new HashMap<>();
+        Map<String, Set<ByteBuffer>> columnsByIndexType = new HashMap<>();
+        for (IndexExpression indexExpression : clause)
+        {
+            SecondaryIndex index = getIndexForColumn(indexExpression.column);
+
+            if (index == null)
+                continue;
+
+            String canonicalIndexName = index.getClass().getCanonicalName();
+            Set<IndexExpression> expressions = expressionsByIndexType.get(canonicalIndexName);
+            Set<ByteBuffer> columns = columnsByIndexType.get(canonicalIndexName);
+            if (expressions == null)
+            {
+                expressions = new HashSet<>();
+                columns = new HashSet<>();
+                expressionsByIndexType.put(canonicalIndexName, expressions);
+                columnsByIndexType.put(canonicalIndexName, columns);
+            }
+
+            expressions.add(indexExpression);
+            columns.add(indexExpression.column);
+        }
+
+        // Validate
+        boolean haveSupportedIndexLookup = false;
+        for (Map.Entry<String, Set<IndexExpression>> expressions : expressionsByIndexType.entrySet())
+        {
+            Set<ByteBuffer> columns = columnsByIndexType.get(expressions.getKey());
+            SecondaryIndex secondaryIndex = getIndexForColumn(columns.iterator().next());
+            SecondaryIndexSearcher searcher = secondaryIndex.createSecondaryIndexSearcher(columns);
+            for (IndexExpression expression : expressions.getValue())
+            {
+                searcher.validate(expression);
+                haveSupportedIndexLookup |= secondaryIndex.supportsOperator(expression.operator);
+            }
+        }
+
+        if (!haveSupportedIndexLookup)
+        {
+            // build the error message
+            int i = 0;
+            StringBuilder sb = new StringBuilder("No secondary indexes on the restricted columns support the provided operators: ");
+            for (Map.Entry<String, Set<IndexExpression>> expressions : expressionsByIndexType.entrySet())
+            {
+                for (IndexExpression expression : expressions.getValue())
+                {
+                    if (i++ > 0)
+                        sb.append(", ");
+                    sb.append("'");
+                    String columnName;
+                    try
+                    {
+                        columnName = ByteBufferUtil.string(expression.column);
+                    }
+                    catch (CharacterCodingException ex)
+                    {
+                        columnName = "<unprintable>";
+                    }
+                    sb.append(columnName).append(" ").append(expression.operator).append(" <value>").append("'");
+                }
+            }
+
+            throw new InvalidRequestException(sb.toString());
+        }
+    }
+
+    /**
      * Performs a search across a number of column indexes
-     * TODO: add support for querying across index types
      *
      * @param filter the column range to restrict to
      * @return found indexed rows
      */
     public List<Row> search(ExtendedFilter filter)
     {
-        List<SecondaryIndexSearcher> indexSearchers = getIndexSearchersForQuery(filter.getClause());
-
-        if (indexSearchers.isEmpty())
+        SecondaryIndexSearcher mostSelective = getHighestSelectivityIndexSearcher(filter.getClause());
+        if (mostSelective == null)
             return Collections.emptyList();
-
-        //We currently don't support searching across multiple index types
-        if (indexSearchers.size() > 1)
-            throw new RuntimeException("Unable to search across multiple secondary index types");
-
-        return indexSearchers.get(0).search(filter);
+        else
+            return mostSelective.search(filter);
     }
 
     public Set<SecondaryIndex> getIndexesByNames(Set<String> idxNames)
@@ -610,14 +666,48 @@ public class SecondaryIndexManager
             index.setIndexRemoved();
     }
 
-    public boolean validate(Cell cell)
+    public SecondaryIndex validate(ByteBuffer rowKey, Cell cell)
     {
         for (SecondaryIndex index : indexFor(cell.name()))
         {
-            if (!index.validate(cell))
-                return false;
+            if (!index.validate(rowKey, cell))
+                return index;
         }
-        return true;
+        return null;
+    }
+
+    static boolean shouldCleanupOldValue(Cell oldCell, Cell newCell)
+    {
+        // If any one of name/value/timestamp are different, then we
+        // should delete from the index. If not, then we can infer that
+        // at least one of the cells is an ExpiringColumn and that the
+        // difference is in the expiry time. In this case, we don't want to
+        // delete the old value from the index as the tombstone we insert
+        // will just hide the inserted value.
+        // Completely identical cells (including expiring columns with
+        // identical ttl & localExpirationTime) will not get this far due
+        // to the oldCell.equals(newColumn) in StandardUpdater.update
+        return !oldCell.name().equals(newCell.name())
+            || !oldCell.value().equals(newCell.value())
+            || oldCell.timestamp() != newCell.timestamp();
+    }
+
+    private Set<String> filterByColumn(Set<String> idxNames)
+    {
+        Set<SecondaryIndex> indexes = getIndexesByNames(idxNames);
+        Set<String> filtered = new HashSet<>(idxNames.size());
+        for (SecondaryIndex candidate : indexes)
+        {
+            for (ColumnDefinition column : baseCfs.metadata.allColumns())
+            {
+                if (candidate.indexes(column))
+                {
+                    filtered.add(candidate.getIndexName());
+                    break;
+                }
+            }
+        }
+        return filtered;
     }
 
     public static interface Updater
@@ -705,15 +795,25 @@ public class SecondaryIndexManager
         {
             if (oldCell.equals(cell))
                 return;
-            
+
             for (SecondaryIndex index : indexFor(cell.name()))
             {
                 if (index instanceof PerColumnSecondaryIndex)
                 {
                     if (cell.isLive())
+                    {
                         ((PerColumnSecondaryIndex) index).update(key.getKey(), oldCell, cell, opGroup);
+                    }
                     else
-                        ((PerColumnSecondaryIndex) index).delete(key.getKey(), oldCell, opGroup);
+                    {
+                        // Usually we want to delete the old value from the index, except when
+                        // name/value/timestamp are all equal, but the columns themselves
+                        // are not (as is the case when overwriting expiring columns with
+                        // identical values and ttl) Then, we don't want to delete as the
+                        // tombstone will hide the new value we just inserted; see CASSANDRA-7268
+                        if (shouldCleanupOldValue(oldCell, cell))
+                            ((PerColumnSecondaryIndex) index).delete(key.getKey(), oldCell, opGroup);
+                    }
                 }
             }
         }
@@ -733,5 +833,32 @@ public class SecondaryIndexManager
             for (SecondaryIndex index : rowLevelIndexMap.values())
                 ((PerRowSecondaryIndex) index).index(key.getKey(), cf);
         }
+
+    }
+
+    public SecondaryIndexSearcher getHighestSelectivityIndexSearcher(List<IndexExpression> clause)
+    {
+        if (clause == null)
+            return null;
+
+        List<SecondaryIndexSearcher> indexSearchers = getIndexSearchersForQuery(clause);
+
+        if (indexSearchers.isEmpty())
+            return null;
+
+        SecondaryIndexSearcher mostSelective = null;
+        long bestEstimate = Long.MAX_VALUE;
+        for (SecondaryIndexSearcher searcher : indexSearchers)
+        {
+            SecondaryIndex highestSelectivityIndex = searcher.highestSelectivityIndex(clause);
+            long estimate = highestSelectivityIndex.estimateResultRows();
+            if (estimate <= bestEstimate)
+            {
+                bestEstimate = estimate;
+                mostSelective = searcher;
+            }
+        }
+
+        return mostSelective;
     }
 }

@@ -21,6 +21,7 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.base.Stopwatch;
 import org.slf4j.helpers.MessageFormatter;
@@ -28,7 +29,7 @@ import org.slf4j.helpers.MessageFormatter;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.db.ArrayBackedSortedColumns;
+import org.apache.cassandra.db.CFRowAdder;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -46,6 +47,10 @@ public class TraceState
     public final InetAddress coordinator;
     public final Stopwatch watch;
     public final ByteBuffer sessionIdBytes;
+
+    // Multiple requests can use the same TraceState at a time, so we need to reference count.
+    // See CASSANDRA-7626 for more details.
+    private final AtomicInteger references = new AtomicInteger(1);
 
     public TraceState(InetAddress coordinator, UUID sessionId)
     {
@@ -86,22 +91,41 @@ public class TraceState
 
     public static void trace(final ByteBuffer sessionIdBytes, final String message, final int elapsed)
     {
-        final ByteBuffer eventId = ByteBuffer.wrap(UUIDGen.getTimeUUIDBytes());
         final String threadName = Thread.currentThread().getName();
 
         StageManager.getStage(Stage.TRACING).execute(new WrappedRunnable()
         {
             public void runMayThrow()
             {
-                CFMetaData cfMeta = CFMetaData.TraceEventsCf;
-                ColumnFamily cf = ArrayBackedSortedColumns.factory.create(cfMeta);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("activity")), message);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("source")), FBUtilities.getBroadcastAddress());
+                Mutation mutation = new Mutation(Tracing.TRACE_KS, sessionIdBytes);
+                ColumnFamily cells = mutation.addOrGet(CFMetaData.TraceEventsCf);
+
+                CFRowAdder adder = new CFRowAdder(cells, cells.metadata().comparator.make(UUIDGen.getTimeUUID()), FBUtilities.timestampMicros());
+                adder.add("activity", message);
+                adder.add("source", FBUtilities.getBroadcastAddress());
                 if (elapsed >= 0)
-                    Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("source_elapsed")), elapsed);
-                Tracing.addColumn(cf, Tracing.buildName(cfMeta, eventId, ByteBufferUtil.bytes("thread")), threadName);
-                Tracing.mutateWithCatch(new Mutation(Tracing.TRACE_KS, sessionIdBytes, cf));
+                    adder.add("source_elapsed", elapsed);
+                adder.add("thread", threadName);
+
+                Tracing.mutateWithCatch(mutation);
             }
         });
+    }
+
+    public boolean acquireReference()
+    {
+        while (true)
+        {
+            int n = references.get();
+            if (n <= 0)
+                return false;
+            if (references.compareAndSet(n, n + 1))
+                return true;
+        }
+    }
+
+    public int releaseReference()
+    {
+        return references.decrementAndGet();
     }
 }

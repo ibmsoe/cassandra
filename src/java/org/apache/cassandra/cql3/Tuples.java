@@ -71,7 +71,7 @@ public class Tuples
 
                 values.add(value);
             }
-            DelayedValue value = new DelayedValue(values);
+            DelayedValue value = new DelayedValue((TupleType)receiver.type, values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
@@ -81,6 +81,7 @@ public class Tuples
                 throw new InvalidRequestException(String.format("Expected %d elements in value tuple, but got %d: %s", receivers.size(), elements.size(), this));
 
             List<Term> values = new ArrayList<>(elements.size());
+            List<AbstractType<?>> types = new ArrayList<>(elements.size());
             boolean allTerminal = true;
             for (int i = 0; i < elements.size(); i++)
             {
@@ -89,8 +90,9 @@ public class Tuples
                     allTerminal = false;
 
                 values.add(t);
+                types.add(receivers.get(i).type);
             }
-            DelayedValue value = new DelayedValue(values);
+            DelayedValue value = new DelayedValue(new TupleType(types), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
@@ -166,10 +168,12 @@ public class Tuples
      */
     public static class DelayedValue extends Term.NonTerminal
     {
+        public final TupleType type;
         public final List<Term> elements;
 
-        public DelayedValue(List<Term> elements)
+        public DelayedValue(TupleType type, List<Term> elements)
         {
+            this.type = type;
             this.elements = elements;
         }
 
@@ -190,13 +194,17 @@ public class Tuples
 
         private ByteBuffer[] bindInternal(QueryOptions options) throws InvalidRequestException
         {
-            // Inside tuples, we must force the serialization of collections whatever the protocol version is in
-            // use since we're going to store directly that serialized value.
-            options = options.withProtocolVersion(3);
+            int version = options.getProtocolVersion();
 
             ByteBuffer[] buffers = new ByteBuffer[elements.size()];
             for (int i = 0; i < elements.size(); i++)
+            {
                 buffers[i] = elements.get(i).bindAndGet(options);
+                // Inside tuples, we must force the serialization of collections to v3 whatever protocol
+                // version is in use since we're going to store directly that serialized value.
+                if (version < 3 && type.type(i).isCollection())
+                    buffers[i] = ((CollectionType)type.type(i)).getSerializer().reserializeToV3(buffers[i]);
+            }
             return buffers;
         }
 
@@ -232,21 +240,21 @@ public class Tuples
             this.elements = items;
         }
 
-        public static InValue fromSerialized(ByteBuffer value, ListType type) throws InvalidRequestException
+        public static InValue fromSerialized(ByteBuffer value, ListType type, QueryOptions options) throws InvalidRequestException
         {
             try
             {
                 // Collections have this small hack that validate cannot be called on a serialized object,
-                // but compose does the validation (so we're fine).
-                List<?> l = (List<?>)type.compose(value);
+                // but the deserialization does the validation (so we're fine).
+                List<?> l = (List<?>)type.getSerializer().deserializeForNativeProtocol(value, options.getProtocolVersion());
 
-                assert type.elements instanceof TupleType;
-                TupleType tupleType = (TupleType) type.elements;
+                assert type.getElementsType() instanceof TupleType;
+                TupleType tupleType = (TupleType) type.getElementsType();
 
                 // type.split(bytes)
                 List<List<ByteBuffer>> elements = new ArrayList<>(l.size());
                 for (Object element : l)
-                    elements.add(Arrays.asList(tupleType.split(type.elements.decompose(element))));
+                    elements.add(Arrays.asList(tupleType.split(type.getElementsType().decompose(element))));
                 return new InValue(elements);
             }
             catch (MarshalException e)
@@ -329,15 +337,16 @@ public class Tuples
                 if (i < receivers.size() - 1)
                     inName.append(",");
 
-                if (receiver.type instanceof CollectionType)
-                    throw new InvalidRequestException("Collection columns do not support IN relations");
+                if (receiver.type.isCollection() && receiver.type.isMultiCell())
+                    throw new InvalidRequestException("Non-frozen collection columns do not support IN relations");
+
                 types.add(receiver.type);
             }
             inName.append(')');
 
             ColumnIdentifier identifier = new ColumnIdentifier(inName.toString(), true);
             TupleType type = new TupleType(types);
-            return new ColumnSpecification(receivers.get(0).ksName, receivers.get(0).cfName, identifier, ListType.getInstance(type));
+            return new ColumnSpecification(receivers.get(0).ksName, receivers.get(0).cfName, identifier, ListType.getInstance(type, false));
         }
 
         public AbstractMarker prepare(String keyspace, List<? extends ColumnSpecification> receivers) throws InvalidRequestException
@@ -383,7 +392,7 @@ public class Tuples
         public InValue bind(QueryOptions options) throws InvalidRequestException
         {
             ByteBuffer value = options.getValues().get(bindIndex);
-            return value == null ? null : InValue.fromSerialized(value, (ListType)receiver.type);
+            return value == null ? null : InValue.fromSerialized(value, (ListType)receiver.type, options);
         }
     }
 

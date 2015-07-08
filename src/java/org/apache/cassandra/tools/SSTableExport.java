@@ -38,9 +38,6 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.codehaus.jackson.JsonGenerator;
 import org.codehaus.jackson.map.ObjectMapper;
 
-import static org.apache.cassandra.utils.ByteBufferUtil.bytesToHex;
-import static org.apache.cassandra.utils.ByteBufferUtil.hexToBytes;
-
 /**
  * Export SSTables to JSON format.
  */
@@ -188,7 +185,7 @@ public class SSTableExport
     {
         out.print("{");
         writeKey(out, "key");
-        writeJSON(out, bytesToHex(key.getKey()));
+        writeJSON(out, metadata.getKeyValidator().getString(key.getKey()));
         out.print(",\n");
 
         if (!deletionInfo.isLive())
@@ -222,26 +219,33 @@ public class SSTableExport
      *
      * @param desc the descriptor of the file to export the rows from
      * @param outs PrintStream to write the output to
+     * @param metadata Metadata to print keys in a proper format
      * @throws IOException on failure to read/write input/output
      */
-    public static void enumeratekeys(Descriptor desc, PrintStream outs)
+    public static void enumeratekeys(Descriptor desc, PrintStream outs, CFMetaData metadata)
     throws IOException
     {
         KeyIterator iter = new KeyIterator(desc);
-        DecoratedKey lastKey = null;
-        while (iter.hasNext())
+        try
         {
-            DecoratedKey key = iter.next();
+            DecoratedKey lastKey = null;
+            while (iter.hasNext())
+            {
+                DecoratedKey key = iter.next();
 
-            // validate order of the keys in the sstable
-            if (lastKey != null && lastKey.compareTo(key) > 0)
-                throw new IOException("Key out of order! " + lastKey + " > " + key);
-            lastKey = key;
+                // validate order of the keys in the sstable
+                if (lastKey != null && lastKey.compareTo(key) > 0)
+                    throw new IOException("Key out of order! " + lastKey + " > " + key);
+                lastKey = key;
 
-            outs.println(bytesToHex(key.getKey()));
-            checkStream(outs); // flushes
+                outs.println(metadata.getKeyValidator().getString(key.getKey()));
+                checkStream(outs); // flushes
+            }
         }
-        iter.close();
+        finally
+        {
+            iter.close();
+        }
     }
 
     /**
@@ -251,94 +255,104 @@ public class SSTableExport
      * @param outs     PrintStream to write the output to
      * @param toExport the keys corresponding to the rows to export
      * @param excludes keys to exclude from export
+     * @param metadata Metadata to print keys in a proper format
      * @throws IOException on failure to read/write input/output
      */
-    public static void export(Descriptor desc, PrintStream outs, Collection<String> toExport, String[] excludes) throws IOException
+    public static void export(Descriptor desc, PrintStream outs, Collection<String> toExport, String[] excludes, CFMetaData metadata) throws IOException
     {
         SSTableReader sstable = SSTableReader.open(desc);
         RandomAccessReader dfile = sstable.openDataReader();
-
-        IPartitioner<?> partitioner = sstable.partitioner;
-
-        if (excludes != null)
-            toExport.removeAll(Arrays.asList(excludes));
-
-        outs.println("[");
-
-        int i = 0;
-
-        // last key to compare order
-        DecoratedKey lastKey = null;
-
-        for (String key : toExport)
+        try
         {
-            DecoratedKey decoratedKey = partitioner.decorateKey(hexToBytes(key));
+            IPartitioner partitioner = sstable.partitioner;
 
-            if (lastKey != null && lastKey.compareTo(decoratedKey) > 0)
-                throw new IOException("Key out of order! " + lastKey + " > " + decoratedKey);
+            if (excludes != null)
+                toExport.removeAll(Arrays.asList(excludes));
 
-            lastKey = decoratedKey;
+            outs.println("[");
 
-            RowIndexEntry entry = sstable.getPosition(decoratedKey, SSTableReader.Operator.EQ);
-            if (entry == null)
-                continue;
+            int i = 0;
 
-            dfile.seek(entry.position);
-            ByteBufferUtil.readWithShortLength(dfile); // row key
-            DeletionInfo deletionInfo = new DeletionInfo(DeletionTime.serializer.deserialize(dfile));
-            Iterator<OnDiskAtom> atomIterator = sstable.metadata.getOnDiskIterator(dfile, sstable.descriptor.version);
+            // last key to compare order
+            DecoratedKey lastKey = null;
 
-            checkStream(outs);
+            for (String key : toExport)
+            {
+                DecoratedKey decoratedKey = partitioner.decorateKey(metadata.getKeyValidator().fromString(key));
 
-            if (i != 0)
-                outs.println(",");
-            i++;
-            serializeRow(deletionInfo, atomIterator, sstable.metadata, decoratedKey, outs);
+                if (lastKey != null && lastKey.compareTo(decoratedKey) > 0)
+                    throw new IOException("Key out of order! " + lastKey + " > " + decoratedKey);
+
+                lastKey = decoratedKey;
+
+                RowIndexEntry entry = sstable.getPosition(decoratedKey, SSTableReader.Operator.EQ);
+                if (entry == null)
+                    continue;
+
+                dfile.seek(entry.position);
+                ByteBufferUtil.readWithShortLength(dfile); // row key
+                DeletionInfo deletionInfo = new DeletionInfo(DeletionTime.serializer.deserialize(dfile));
+
+                Iterator<OnDiskAtom> atomIterator = sstable.metadata.getOnDiskIterator(dfile, sstable.descriptor.version);
+                checkStream(outs);
+
+                if (i != 0)
+                    outs.println(",");
+                i++;
+                serializeRow(deletionInfo, atomIterator, sstable.metadata, decoratedKey, outs);
+            }
+
+            outs.println("\n]");
+            outs.flush();
         }
-
-        outs.println("\n]");
-        outs.flush();
+        finally
+        {
+            dfile.close();
+        }
     }
 
     // This is necessary to accommodate the test suite since you cannot open a Reader more
     // than once from within the same process.
-    static void export(SSTableReader reader, PrintStream outs, String[] excludes) throws IOException
+    static void export(SSTableReader reader, PrintStream outs, String[] excludes, CFMetaData metadata) throws IOException
     {
         Set<String> excludeSet = new HashSet<String>();
 
         if (excludes != null)
             excludeSet = new HashSet<String>(Arrays.asList(excludes));
 
-
         SSTableIdentityIterator row;
-        SSTableScanner scanner = reader.getScanner();
-
-        outs.println("[");
-
-        int i = 0;
-
-        // collecting keys to export
-        while (scanner.hasNext())
+        ISSTableScanner scanner = reader.getScanner();
+        try
         {
-            row = (SSTableIdentityIterator) scanner.next();
+            outs.println("[");
 
-            String currentKey = bytesToHex(row.getKey().getKey());
+            int i = 0;
 
-            if (excludeSet.contains(currentKey))
-                continue;
-            else if (i != 0)
-                outs.println(",");
+            // collecting keys to export
+            while (scanner.hasNext())
+            {
+                row = (SSTableIdentityIterator) scanner.next();
 
-            serializeRow(row, row.getKey(), outs);
-            checkStream(outs);
+                String currentKey = row.getColumnFamily().metadata().getKeyValidator().getString(row.getKey().getKey());
 
-            i++;
+                if (excludeSet.contains(currentKey))
+                    continue;
+                else if (i != 0)
+                    outs.println(",");
+
+                serializeRow(row, row.getKey(), outs);
+                checkStream(outs);
+
+                i++;
+            }
+
+            outs.println("\n]");
+            outs.flush();
         }
-
-        outs.println("\n]");
-        outs.flush();
-
-        scanner.close();
+        finally
+        {
+            scanner.close();
+        }
     }
 
     /**
@@ -347,11 +361,12 @@ public class SSTableExport
      * @param desc     the descriptor of the sstable to read from
      * @param outs     PrintStream to write the output to
      * @param excludes keys to exclude from export
+     * @param metadata Metadata to print keys in a proper format
      * @throws IOException on failure to read/write input/output
      */
-    public static void export(Descriptor desc, PrintStream outs, String[] excludes) throws IOException
+    public static void export(Descriptor desc, PrintStream outs, String[] excludes, CFMetaData metadata) throws IOException
     {
-        export(SSTableReader.open(desc), outs, excludes);
+        export(SSTableReader.open(desc), outs, excludes, metadata);
     }
 
     /**
@@ -359,11 +374,12 @@ public class SSTableExport
      *
      * @param desc     the descriptor of the sstable to read from
      * @param excludes keys to exclude from export
+     * @param metadata Metadata to print keys in a proper format
      * @throws IOException on failure to read/write SSTable/standard out
      */
-    public static void export(Descriptor desc, String[] excludes) throws IOException
+    public static void export(Descriptor desc, String[] excludes, CFMetaData metadata) throws IOException
     {
-        export(desc, System.out, excludes);
+        export(desc, System.out, excludes, metadata);
     }
 
     /**
@@ -403,7 +419,7 @@ public class SSTableExport
         String[] excludes = cmd.getOptionValues(EXCLUDEKEY_OPTION);
         String ssTableFileName = new File(cmd.getArgs()[0]).getAbsolutePath();
 
-        DatabaseDescriptor.loadSchemas();
+        DatabaseDescriptor.loadSchemas(false);
         Descriptor descriptor = Descriptor.fromFilename(ssTableFileName);
 
         // Start by validating keyspace name
@@ -415,7 +431,7 @@ public class SSTableExport
         }
         Keyspace keyspace = Keyspace.open(descriptor.ksname);
 
-        // Make it work for indexes too - find parent cf if necessary
+        // Make it works for indexes too - find parent cf if necessary
         String baseName = descriptor.cfname;
         if (descriptor.cfname.contains("."))
         {
@@ -424,9 +440,10 @@ public class SSTableExport
         }
 
         // IllegalArgumentException will be thrown here if ks/cf pair does not exist
+        ColumnFamilyStore cfStore = null;
         try
         {
-            keyspace.getColumnFamilyStore(baseName);
+            cfStore = keyspace.getColumnFamilyStore(baseName);
         }
         catch (IllegalArgumentException e)
         {
@@ -439,14 +456,14 @@ public class SSTableExport
         {
             if (cmd.hasOption(ENUMERATEKEYS_OPTION))
             {
-                enumeratekeys(descriptor, System.out);
+                enumeratekeys(descriptor, System.out, cfStore.metadata);
             }
             else
             {
                 if ((keys != null) && (keys.length > 0))
-                    export(descriptor, System.out, Arrays.asList(keys), excludes);
+                    export(descriptor, System.out, Arrays.asList(keys), excludes, cfStore.metadata);
                 else
-                    export(descriptor, excludes);
+                    export(descriptor, excludes, cfStore.metadata);
             }
         }
         catch (IOException e)

@@ -20,13 +20,18 @@ package org.apache.cassandra.config;
 import java.io.File;
 import java.io.FileFilter;
 import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,9 +40,10 @@ import java.util.UUID;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.primitives.Longs;
+
+import org.apache.cassandra.thrift.ThriftServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.auth.AllowAllAuthenticator;
 import org.apache.cassandra.auth.AllowAllAuthorizer;
 import org.apache.cassandra.auth.AllowAllInternodeAuthenticator;
@@ -65,6 +71,7 @@ import org.apache.cassandra.scheduler.NoScheduler;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.memory.HeapPool;
 import org.apache.cassandra.utils.memory.NativePool;
 import org.apache.cassandra.utils.memory.MemtablePool;
@@ -89,7 +96,7 @@ public class DatabaseDescriptor
     private static IInternodeAuthenticator internodeAuthenticator;
 
     /* Hashing strategy Random or OPHF */
-    private static IPartitioner<?> partitioner;
+    private static IPartitioner partitioner;
     private static String paritionerName;
 
     private static Config.DiskAccessMode indexAccessMode;
@@ -139,18 +146,146 @@ public class DatabaseDescriptor
         {
             logger.error("Fatal error during configuration loading", e);
             System.err.println(e.getMessage() + "\nFatal error during configuration loading; unable to start. See log for stacktrace.");
+            JVMStabilityInspector.inspectThrowable(e);
             System.exit(1);
         }
     }
 
     @VisibleForTesting
-    static Config loadConfig() throws ConfigurationException
+    public static Config loadConfig() throws ConfigurationException
     {
         String loaderClass = System.getProperty("cassandra.config.loader");
         ConfigurationLoader loader = loaderClass == null
                                    ? new YamlConfigurationLoader()
                                    : FBUtilities.<ConfigurationLoader>construct(loaderClass, "configuration loading");
         return loader.loadConfig();
+    }
+
+    private static InetAddress getNetworkInterfaceAddress(String intf, String configName, boolean preferIPv6) throws ConfigurationException
+    {
+        try
+        {
+            NetworkInterface ni = NetworkInterface.getByName(intf);
+            if (ni == null)
+                throw new ConfigurationException("Configured " + configName + " \"" + intf + "\" could not be found");
+            Enumeration<InetAddress> addrs = ni.getInetAddresses();
+            if (!addrs.hasMoreElements())
+                throw new ConfigurationException("Configured " + configName + " \"" + intf + "\" was found, but had no addresses");
+
+            /*
+             * Try to return the first address of the preferred type, otherwise return the first address
+             */
+            InetAddress retval = null;
+            while (addrs.hasMoreElements())
+            {
+                InetAddress temp = addrs.nextElement();
+                if (preferIPv6 && temp.getClass() == Inet6Address.class) return temp;
+                if (!preferIPv6 && temp.getClass() == Inet4Address.class) return temp;
+                if (retval == null) retval = temp;
+            }
+            return retval;
+        }
+        catch (SocketException e)
+        {
+            throw new ConfigurationException("Configured " + configName + " \"" + intf + "\" caused an exception", e);
+        }
+    }
+
+    @VisibleForTesting
+    static void applyAddressConfig(Config config) throws ConfigurationException
+    {
+        listenAddress = null;
+        rpcAddress = null;
+        broadcastAddress = null;
+        broadcastRpcAddress = null;
+
+        /* Local IP, hostname or interface to bind services to */
+        if (config.listen_address != null && config.listen_interface != null)
+        {
+            throw new ConfigurationException("Set listen_address OR listen_interface, not both");
+        }
+        else if (config.listen_address != null)
+        {
+            try
+            {
+                listenAddress = InetAddress.getByName(config.listen_address);
+            }
+            catch (UnknownHostException e)
+            {
+                throw new ConfigurationException("Unknown listen_address '" + config.listen_address + "'");
+            }
+
+            if (listenAddress.isAnyLocalAddress())
+                throw new ConfigurationException("listen_address cannot be a wildcard address (" + config.listen_address + ")!");
+        }
+        else if (config.listen_interface != null)
+        {
+            listenAddress = getNetworkInterfaceAddress(config.listen_interface, "listen_interface", config.listen_interface_prefer_ipv6);
+        }
+
+        /* Gossip Address to broadcast */
+        if (config.broadcast_address != null)
+        {
+            try
+            {
+                broadcastAddress = InetAddress.getByName(config.broadcast_address);
+            }
+            catch (UnknownHostException e)
+            {
+                throw new ConfigurationException("Unknown broadcast_address '" + config.broadcast_address + "'");
+            }
+
+            if (broadcastAddress.isAnyLocalAddress())
+                throw new ConfigurationException("broadcast_address cannot be a wildcard address (" + config.broadcast_address + ")!");
+        }
+
+        /* Local IP, hostname or interface to bind RPC server to */
+        if (config.rpc_address != null && config.rpc_interface != null)
+        {
+            throw new ConfigurationException("Set rpc_address OR rpc_interface, not both");
+        }
+        else if (config.rpc_address != null)
+        {
+            try
+            {
+                rpcAddress = InetAddress.getByName(config.rpc_address);
+            }
+            catch (UnknownHostException e)
+            {
+                throw new ConfigurationException("Unknown host in rpc_address " + config.rpc_address);
+            }
+        }
+        else if (config.rpc_interface != null)
+        {
+            rpcAddress = getNetworkInterfaceAddress(config.rpc_interface, "rpc_interface", config.rpc_interface_prefer_ipv6);
+        }
+        else
+        {
+            rpcAddress = FBUtilities.getLocalAddress();
+        }
+
+        /* RPC address to broadcast */
+        if (config.broadcast_rpc_address != null)
+        {
+            try
+            {
+                broadcastRpcAddress = InetAddress.getByName(config.broadcast_rpc_address);
+            }
+            catch (UnknownHostException e)
+            {
+                throw new ConfigurationException("Unknown broadcast_rpc_address '" + config.broadcast_rpc_address + "'");
+            }
+
+            if (broadcastRpcAddress.isAnyLocalAddress())
+                throw new ConfigurationException("broadcast_rpc_address cannot be a wildcard address (" + config.broadcast_rpc_address + ")!");
+        }
+        else
+        {
+            if (rpcAddress.isAnyLocalAddress())
+                throw new ConfigurationException("If rpc_address is set to a wildcard address (" + config.rpc_address + "), then " +
+                                                 "you must set broadcast_rpc_address to a value other than " + config.rpc_address);
+            broadcastRpcAddress = rpcAddress;
+        }
     }
 
     private static void applyConfig(Config config) throws ConfigurationException
@@ -190,23 +325,34 @@ public class DatabaseDescriptor
         if (conf.commitlog_total_space_in_mb == null)
             conf.commitlog_total_space_in_mb = hasLargeAddressSpace() ? 8192 : 32;
 
-        /* evaluate the DiskAccessMode Config directive, which also affects indexAccessMode selection */
-        if (conf.disk_access_mode == Config.DiskAccessMode.auto)
-        {
-            conf.disk_access_mode = hasLargeAddressSpace() ? Config.DiskAccessMode.mmap : Config.DiskAccessMode.standard;
-            indexAccessMode = conf.disk_access_mode;
-            logger.info("DiskAccessMode 'auto' determined to be {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
-        }
-        else if (conf.disk_access_mode == Config.DiskAccessMode.mmap_index_only)
+        // Always force standard mode access on Windows - CASSANDRA-6993. Windows won't allow deletion of hard-links to files that
+        // are memory-mapped which causes trouble with snapshots.
+        if (FBUtilities.isWindows())
         {
             conf.disk_access_mode = Config.DiskAccessMode.standard;
-            indexAccessMode = Config.DiskAccessMode.mmap;
-            logger.info("DiskAccessMode is {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
+            indexAccessMode = conf.disk_access_mode;
+            logger.info("Windows environment detected.  DiskAccessMode set to {}, indexAccessMode {}", conf.disk_access_mode, indexAccessMode);
         }
         else
         {
-            indexAccessMode = conf.disk_access_mode;
-            logger.info("DiskAccessMode is {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
+            /* evaluate the DiskAccessMode Config directive, which also affects indexAccessMode selection */
+            if (conf.disk_access_mode == Config.DiskAccessMode.auto)
+            {
+                conf.disk_access_mode = hasLargeAddressSpace() ? Config.DiskAccessMode.mmap : Config.DiskAccessMode.standard;
+                indexAccessMode = conf.disk_access_mode;
+                logger.info("DiskAccessMode 'auto' determined to be {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
+            }
+            else if (conf.disk_access_mode == Config.DiskAccessMode.mmap_index_only)
+            {
+                conf.disk_access_mode = Config.DiskAccessMode.standard;
+                indexAccessMode = Config.DiskAccessMode.mmap;
+                logger.info("DiskAccessMode is {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
+            }
+            else
+            {
+                indexAccessMode = conf.disk_access_mode;
+                logger.info("DiskAccessMode is {}, indexAccessMode is {}", conf.disk_access_mode, indexAccessMode);
+            }
         }
 
         /* Authentication and authorization backend, implementing IAuthenticator and IAuthorizer */
@@ -288,104 +434,22 @@ public class DatabaseDescriptor
             logger.info("Global memtable off-heap threshold is disabled, HeapAllocator will be used instead");
         else
             logger.info("Global memtable off-heap threshold is enabled at {}MB", conf.memtable_offheap_space_in_mb);
-        if (conf.memtable_cleanup_threshold < 0.01f)
-            throw new ConfigurationException("memtable_cleanup_threshold must be >= 0.01");
-        if (conf.memtable_cleanup_threshold > 0.99f)
-            throw new ConfigurationException("memtable_cleanup_threshold must be <= 0.99");
-        if (conf.memtable_cleanup_threshold < 0.1f)
-            logger.warn("memtable_cleanup_threshold is set very low, which may cause performance degradation");
 
-        if (conf.memtable_flush_writers < 1)
-            throw new ConfigurationException("memtable_flush_writers must be at least 1");
-
-        /* Local IP or hostname to bind services to */
-        if (conf.listen_address != null)
-        {
-            if (conf.listen_address.equals("0.0.0.0"))
-                throw new ConfigurationException("listen_address cannot be 0.0.0.0!");
-            try
-            {
-                listenAddress = InetAddress.getByName(conf.listen_address);
-            }
-            catch (UnknownHostException e)
-            {
-                throw new ConfigurationException("Unknown listen_address '" + conf.listen_address + "'");
-            }
-        }
-
-        /* Gossip Address to broadcast */
-        if (conf.broadcast_address != null)
-        {
-            if (conf.broadcast_address.equals("0.0.0.0"))
-            {
-                throw new ConfigurationException("broadcast_address cannot be 0.0.0.0!");
-            }
-
-            try
-            {
-                broadcastAddress = InetAddress.getByName(conf.broadcast_address);
-            }
-            catch (UnknownHostException e)
-            {
-                throw new ConfigurationException("Unknown broadcast_address '" + conf.broadcast_address + "'");
-            }
-        }
-
-        /* Local IP or hostname to bind RPC server to */
-        if (conf.rpc_address != null)
-        {
-            try
-            {
-                rpcAddress = InetAddress.getByName(conf.rpc_address);
-            }
-            catch (UnknownHostException e)
-            {
-                throw new ConfigurationException("Unknown host in rpc_address " + conf.rpc_address);
-            }
-        }
-        else
-        {
-            rpcAddress = FBUtilities.getLocalAddress();
-        }
-
-        /* RPC address to broadcast */
-        if (conf.broadcast_rpc_address != null)
-        {
-            if (conf.broadcast_rpc_address.equals("0.0.0.0"))
-                throw new ConfigurationException("broadcast_rpc_address cannot be 0.0.0.0");
-
-            try
-            {
-                broadcastRpcAddress = InetAddress.getByName(conf.broadcast_rpc_address);
-            }
-            catch (UnknownHostException e)
-            {
-                throw new ConfigurationException("Unkown broadcast_rpc_address '" + conf.broadcast_rpc_address + "'");
-            }
-        }
-        else
-        {
-            InetAddress bindAll;
-            try
-            {
-                bindAll = InetAddress.getByAddress(new byte[4]);
-            }
-            catch (UnknownHostException e)
-            {
-                throw new RuntimeException("Host 0.0.0.0 is somehow unknown");
-            }
-
-            if (rpcAddress.equals(bindAll))
-                throw new ConfigurationException("If rpc_address is set to 0.0.0.0, you must set broadcast_rpc_address " +
-                                                 "to a value other than 0.0.0.0");
-            broadcastRpcAddress = rpcAddress;
-        }
+        applyAddressConfig(config);
 
         if (conf.thrift_framed_transport_size_in_mb <= 0)
             throw new ConfigurationException("thrift_framed_transport_size_in_mb must be positive");
 
         if (conf.native_transport_max_frame_size_in_mb <= 0)
             throw new ConfigurationException("native_transport_max_frame_size_in_mb must be positive");
+
+        // fail early instead of OOMing (see CASSANDRA-8116)
+        if (ThriftServer.HSHA.equals(conf.rpc_server_type) && conf.rpc_max_threads == Integer.MAX_VALUE)
+            throw new ConfigurationException("The hsha rpc_server_type is not compatible with an rpc_max_threads " +
+                                             "setting of 'unlimited'.  Please see the comments in cassandra.yaml " +
+                                             "for rpc_server_type and rpc_max_threads.");
+        if (ThriftServer.HSHA.equals(conf.rpc_server_type) && conf.rpc_max_threads > (FBUtilities.getAvailableProcessors() * 2 + 1024))
+            logger.warn("rpc_max_threads setting of {} may be too high for the hsha server and cause unnecessary thread contention, reducing performance", conf.rpc_max_threads);
 
         /* end point snitch */
         if (conf.endpoint_snitch == null)
@@ -447,11 +511,6 @@ public class DatabaseDescriptor
             requestSchedulerId = RequestSchedulerId.keyspace;
         }
 
-        if (conf.in_memory_compaction_limit_in_mb != null && conf.in_memory_compaction_limit_in_mb <= 0)
-        {
-            throw new ConfigurationException("in_memory_compaction_limit_in_mb must be a positive integer");
-        }
-
         // if data dirs, commitlog dir, or saved caches dir are set in cassandra.yaml, use that.  Otherwise,
         // use -Dcassandra.storagedir (set in cassandra-env.sh) as the parent dir for data/, commitlog/, and saved_caches/
         if (conf.commitlog_directory == null)
@@ -487,6 +546,22 @@ public class DatabaseDescriptor
 
         if (conf.commitlog_directory.equals(conf.saved_caches_directory))
             throw new ConfigurationException("saved_caches_directory must not be the same as the commitlog_directory");
+
+        if (conf.memtable_flush_writers == null)
+            conf.memtable_flush_writers = Math.min(8, Math.max(2, Math.min(FBUtilities.getAvailableProcessors(), conf.data_file_directories.length)));
+
+        if (conf.memtable_flush_writers < 1)
+            throw new ConfigurationException("memtable_flush_writers must be at least 1");
+
+        if (conf.memtable_cleanup_threshold == null)
+            conf.memtable_cleanup_threshold = (float) (1.0 / (1 + conf.memtable_flush_writers));
+
+        if (conf.memtable_cleanup_threshold < 0.01f)
+            throw new ConfigurationException("memtable_cleanup_threshold must be >= 0.01");
+        if (conf.memtable_cleanup_threshold > 0.99f)
+            throw new ConfigurationException("memtable_cleanup_threshold must be <= 0.99");
+        if (conf.memtable_cleanup_threshold < 0.1f)
+            logger.warn("memtable_cleanup_threshold is set very low, which may cause performance degradation");
 
         if (conf.concurrent_compactors == null)
             conf.concurrent_compactors = Math.min(8, Math.max(2, Math.min(FBUtilities.getAvailableProcessors(), conf.data_file_directories.length)));
@@ -588,8 +663,21 @@ public class DatabaseDescriptor
         return conf.dynamic_snitch ? new DynamicEndpointSnitch(snitch) : snitch;
     }
 
-    /** load keyspace (keyspace) definitions, but do not initialize the keyspace instances. */
+    /**
+     * load keyspace (keyspace) definitions, but do not initialize the keyspace instances.
+     * Schema version may be updated as the result.
+     */
     public static void loadSchemas()
+    {
+        loadSchemas(true);
+    }
+
+    /**
+     * Load schema definitions.
+     *
+     * @param updateVersion true if schema version needs to be updated
+     */
+    public static void loadSchemas(boolean updateVersion)
     {
         ColumnFamilyStore schemaCFS = SystemKeyspace.schemaCFS(SystemKeyspace.SCHEMA_KEYSPACES_CF);
 
@@ -608,7 +696,8 @@ public class DatabaseDescriptor
             Schema.instance.load(DefsTables.loadFromKeyspace());
         }
 
-        Schema.instance.updateVersion();
+        if (updateVersion)
+            Schema.instance.updateVersion();
     }
 
     private static boolean hasExistingNoSystemTables()
@@ -648,6 +737,28 @@ public class DatabaseDescriptor
     public static int getPermissionsValidity()
     {
         return conf.permissions_validity_in_ms;
+    }
+
+    public static void setPermissionsValidity(int timeout)
+    {
+        conf.permissions_validity_in_ms = timeout;
+    }
+
+    public static int getPermissionsCacheMaxEntries()
+    {
+        return conf.permissions_cache_max_entries;
+    }
+
+    public static int getPermissionsUpdateInterval()
+    {
+        return conf.permissions_update_interval_in_ms == -1
+             ? conf.permissions_validity_in_ms
+             : conf.permissions_update_interval_in_ms;
+    }
+
+    public static void setPermissionsUpdateInterval(int updateInterval)
+    {
+        conf.permissions_update_interval_in_ms = updateInterval;
     }
 
     public static int getThriftFramedTransportSize()
@@ -694,7 +805,7 @@ public class DatabaseDescriptor
         }
     }
 
-    public static IPartitioner<?> getPartitioner()
+    public static IPartitioner getPartitioner()
     {
         return partitioner;
     }
@@ -705,7 +816,7 @@ public class DatabaseDescriptor
     }
 
     /* For tests ONLY, don't use otherwise or all hell will break loose */
-    public static void setPartitioner(IPartitioner<?> newPartitioner)
+    public static void setPartitioner(IPartitioner newPartitioner)
     {
         partitioner = newPartitioner;
     }
@@ -769,8 +880,9 @@ public class DatabaseDescriptor
         {
             if (System.getProperty("cassandra.replace_address", null) != null)
                 return InetAddress.getByName(System.getProperty("cassandra.replace_address", null));
-            else
-                return null;
+            else if (System.getProperty("cassandra.replace_address_first_boot", null) != null)
+                return InetAddress.getByName(System.getProperty("cassandra.replace_address_first_boot", null));
+            return null;
         }
         catch (UnknownHostException e)
         {
@@ -796,6 +908,11 @@ public class DatabaseDescriptor
 
     public static boolean isReplacing()
     {
+        if (System.getProperty("cassandra.replace_address_first_boot", null) != null && SystemKeyspace.bootstrapComplete())
+        {
+            logger.info("Replace address on first boot requested; this node is already bootstrapped");
+            return false;
+        }
         return getReplaceAddress() != null;
     }
 
@@ -917,6 +1034,9 @@ public class DatabaseDescriptor
                 return getTruncateRpcTimeout();
             case READ_REPAIR:
             case MUTATION:
+            case PAXOS_COMMIT:
+            case PAXOS_PREPARE:
+            case PAXOS_PROPOSE:
                 return getWriteRpcTimeout();
             case COUNTER_MUTATION:
                 return getCounterWriteRpcTimeout();
@@ -968,16 +1088,6 @@ public class DatabaseDescriptor
             return conf.memtable_flush_writers;
     }
 
-    public static int getInMemoryCompactionLimit()
-    {
-        return conf.in_memory_compaction_limit_in_mb * 1024 * 1024;
-    }
-
-    public static void setInMemoryCompactionLimit(int sizeInMB)
-    {
-        conf.in_memory_compaction_limit_in_mb = sizeInMB;
-    }
-
     public static int getConcurrentCompactors()
     {
         return conf.concurrent_compactors;
@@ -991,6 +1101,13 @@ public class DatabaseDescriptor
     public static void setCompactionThroughputMbPerSec(int value)
     {
         conf.compaction_throughput_mb_per_sec = value;
+    }
+
+    public static int getCompactionLargePartitionWarningThreshold() { return conf.compaction_large_partition_warning_threshold_mb * 1024 * 1024; }
+
+    public static boolean getDisableSTCSInL0()
+    {
+        return Boolean.getBoolean("cassandra.disable_stcs_in_l0");
     }
 
     public static int getStreamThroughputOutboundMegabitsPerSec()
@@ -1161,6 +1278,25 @@ public class DatabaseDescriptor
         return conf.native_transport_max_frame_size_in_mb * 1024 * 1024;
     }
 
+    public static Long getNativeTransportMaxConcurrentConnections()
+    {
+        return conf.native_transport_max_concurrent_connections;
+    }
+
+    public static void setNativeTransportMaxConcurrentConnections(long nativeTransportMaxConcurrentConnections)
+    {
+        conf.native_transport_max_concurrent_connections = nativeTransportMaxConcurrentConnections;
+    }
+
+    public static Long getNativeTransportMaxConcurrentConnectionsPerIp() {
+        return conf.native_transport_max_concurrent_connections_per_ip;
+    }
+
+    public static void setNativeTransportMaxConcurrentConnectionsPerIp(long native_transport_max_concurrent_connections_per_ip)
+    {
+        conf.native_transport_max_concurrent_connections_per_ip = native_transport_max_concurrent_connections_per_ip;
+    }
+
     public static double getCommitLogSyncBatchWindow()
     {
         return conf.commitlog_sync_batch_window_in_ms;
@@ -1201,6 +1337,16 @@ public class DatabaseDescriptor
         return conf.disk_failure_policy;
     }
 
+    public static void setCommitFailurePolicy(Config.CommitFailurePolicy policy)
+    {
+        conf.commit_failure_policy = policy;
+    }
+
+    public static Config.CommitFailurePolicy getCommitFailurePolicy()
+    {
+        return conf.commit_failure_policy;
+    }
+
     public static boolean isSnapshotBeforeCompaction()
     {
         return conf.snapshot_before_compaction;
@@ -1210,9 +1356,14 @@ public class DatabaseDescriptor
         return conf.auto_snapshot;
     }
 
+    @VisibleForTesting
+    public static void setAutoSnapshot(boolean autoSnapshot) {
+        conf.auto_snapshot = autoSnapshot;
+    }
+
     public static boolean isAutoBootstrap()
     {
-        return conf.auto_bootstrap;
+        return Boolean.parseBoolean(System.getProperty("cassandra.auto_bootstrap", conf.auto_bootstrap.toString()));
     }
 
     public static void setHintedHandoffEnabled(boolean hintedHandoffEnabled)
@@ -1336,6 +1487,11 @@ public class DatabaseDescriptor
         return conf.batchlog_replay_throttle_in_kb;
     }
 
+    public static void setHintedHandoffThrottleInKB(Integer throttleInKB)
+    {
+        conf.hinted_handoff_throttle_in_kb = throttleInKB;
+    }
+
     public static int getMaxHintsThread()
     {
         return conf.max_hints_delivery_threads;
@@ -1409,6 +1565,12 @@ public class DatabaseDescriptor
     public static long getRowCacheSizeInMB()
     {
         return conf.row_cache_size_in_mb;
+    }
+
+    @VisibleForTesting
+    public static void setRowCacheSizeInMB(long val)
+    {
+        conf.row_cache_size_in_mb = val;
     }
 
     public static int getRowCacheSavePeriod()
@@ -1529,5 +1691,15 @@ public class DatabaseDescriptor
         }
         String arch = System.getProperty("os.arch");
         return arch.contains("64") || arch.contains("sparcv9");
+    }
+
+    public static String getOtcCoalescingStrategy()
+    {
+        return conf.otc_coalescing_strategy;
+    }
+
+    public static int getOtcCoalescingWindow()
+    {
+        return conf.otc_coalescing_window_us;
     }
 }

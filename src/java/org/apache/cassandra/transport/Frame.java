@@ -23,7 +23,6 @@ import java.util.EnumSet;
 import java.util.List;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.*;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.MessageToMessageDecoder;
@@ -35,6 +34,8 @@ import org.apache.cassandra.transport.messages.ErrorMessage;
 
 public class Frame
 {
+    public static final byte PROTOCOL_VERSION_MASK = 0x7f;
+
     public final Header header;
     public final ByteBuf body;
 
@@ -114,14 +115,15 @@ public class Frame
             COMPRESSED,
             TRACING;
 
+            private static final Flag[] ALL_VALUES = values();
+
             public static EnumSet<Flag> deserialize(int flags)
             {
                 EnumSet<Flag> set = EnumSet.noneOf(Flag.class);
-                Flag[] values = Flag.values();
-                for (int n = 0; n < 8; n++)
+                for (int n = 0; n < ALL_VALUES.length; n++)
                 {
                     if ((flags & (1 << n)) != 0)
-                        set.add(values[n]);
+                        set.add(ALL_VALUES[n]);
                 }
                 return set;
             }
@@ -178,7 +180,7 @@ public class Frame
 
             int firstByte = buffer.getByte(idx++);
             Message.Direction direction = Message.Direction.extractFromVersion(firstByte);
-            int version = firstByte & 0x7F;
+            int version = firstByte & PROTOCOL_VERSION_MASK;
 
             if (version > Server.CURRENT_VERSION)
                 throw new ProtocolException("Invalid or unsupported protocol version: " + version);
@@ -204,7 +206,15 @@ public class Frame
             }
 
             // This throws a protocol exceptions if the opcode is unknown
-            Message.Type type = Message.Type.fromOpcode(buffer.getByte(idx++), direction);
+            Message.Type type;
+            try
+            {
+                type = Message.Type.fromOpcode(buffer.getByte(idx++), direction);
+            }
+            catch (ProtocolException e)
+            {
+                throw ErrorMessage.wrap(e, streamId);
+            }
 
             long bodyLength = buffer.getUnsignedInt(idx);
             idx += Header.BODY_LENGTH_SIZE;
@@ -212,7 +222,7 @@ public class Frame
             if (bodyLength < 0)
             {
                 buffer.skipBytes(headerLength);
-                throw new ProtocolException("Invalid frame body length: " + bodyLength);
+                throw ErrorMessage.wrap(new ProtocolException("Invalid frame body length: " + bodyLength), streamId);
             }
 
             long frameLength = bodyLength + headerLength;
@@ -247,7 +257,11 @@ public class Frame
             }
             else if (connection.getVersion() != version)
             {
-                throw new ProtocolException(String.format("Invalid message version. Got %d but previous messages on this connection had version %d", version, connection.getVersion()));
+                throw ErrorMessage.wrap(
+                        new ProtocolException(String.format(
+                                "Invalid message version. Got %d but previous messages on this connection had version %d",
+                                version, connection.getVersion())),
+                        streamId);
             }
 
             results.add(new Frame(new Header(version, flags, streamId, type), body));
@@ -295,7 +309,8 @@ public class Frame
             header.writeByte(type.opcode);
             header.writeInt(frame.body.readableBytes());
 
-            results.add(Unpooled.wrappedBuffer(header, frame.body));
+            results.add(header);
+            results.add(frame.body);
         }
     }
 

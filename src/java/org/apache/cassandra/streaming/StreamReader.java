@@ -40,7 +40,6 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableWriter;
-import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.messages.FileMessageHeader;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -79,10 +78,15 @@ public class StreamReader
      */
     public SSTableWriter read(ReadableByteChannel channel) throws IOException
     {
-        logger.info("reading file from {}, repairedAt = {}", session.peer, repairedAt);
+        logger.debug("reading file from {}, repairedAt = {}", session.peer, repairedAt);
         long totalSize = totalSize();
 
         Pair<String, String> kscf = Schema.instance.getCF(cfId);
+        if (kscf == null)
+        {
+            // schema was dropped during streaming
+            throw new IOException("CF " + cfId + " was dropped during streaming");
+        }
         ColumnFamilyStore cfs = Keyspace.open(kscf.left).getColumnFamilyStore(kscf.right);
 
         SSTableWriter writer = createWriter(cfs, totalSize, repairedAt);
@@ -111,7 +115,7 @@ public class StreamReader
 
     protected SSTableWriter createWriter(ColumnFamilyStore cfs, long totalSize, long repairedAt) throws IOException
     {
-        Directories.DataDirectory localDir = cfs.directories.getWriteableLocation();
+        Directories.DataDirectory localDir = cfs.directories.getWriteableLocation(totalSize);
         if (localDir == null)
             throw new IOException("Insufficient disk space to store " + totalSize + " bytes");
         desc = Descriptor.fromFilename(cfs.getTempSSTablePath(cfs.directories.getLocationForDisk(localDir)));

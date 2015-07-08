@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeoutException;
@@ -47,6 +48,7 @@ import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql.CQLStatement;
 import org.apache.cassandra.cql.QueryProcessor;
 import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.composites.*;
 import org.apache.cassandra.db.context.CounterContext;
@@ -62,7 +64,7 @@ import org.apache.cassandra.locator.DynamicEndpointSnitch;
 import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.scheduler.IRequestScheduler;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.service.CASConditions;
+import org.apache.cassandra.service.CASRequest;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageProxy;
@@ -101,7 +103,7 @@ public class CassandraServer implements Cassandra.Iface
         return ThriftSessionManager.instance.currentSession();
     }
 
-    protected Map<DecoratedKey, ColumnFamily> readColumnFamily(List<ReadCommand> commands, org.apache.cassandra.db.ConsistencyLevel consistency_level)
+    protected Map<DecoratedKey, ColumnFamily> readColumnFamily(List<ReadCommand> commands, org.apache.cassandra.db.ConsistencyLevel consistency_level, ClientState cState)
     throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
     {
         // TODO - Support multiple column families per row, right now row only contains 1 column family
@@ -113,7 +115,7 @@ public class CassandraServer implements Cassandra.Iface
             schedule(DatabaseDescriptor.getReadRpcTimeout());
             try
             {
-                rows = StorageProxy.read(commands, consistency_level);
+                rows = StorageProxy.read(commands, consistency_level, cState);
             }
             finally
             {
@@ -267,10 +269,10 @@ public class CassandraServer implements Cassandra.Iface
         return thriftSuperColumns;
     }
 
-    private Map<ByteBuffer, List<ColumnOrSuperColumn>> getSlice(List<ReadCommand> commands, boolean subColumnsOnly, org.apache.cassandra.db.ConsistencyLevel consistency_level)
+    private Map<ByteBuffer, List<ColumnOrSuperColumn>> getSlice(List<ReadCommand> commands, boolean subColumnsOnly, org.apache.cassandra.db.ConsistencyLevel consistency_level, ClientState cState)
     throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
     {
-        Map<DecoratedKey, ColumnFamily> columnFamilies = readColumnFamily(commands, consistency_level);
+        Map<DecoratedKey, ColumnFamily> columnFamilies = readColumnFamily(commands, consistency_level, cState);
         Map<ByteBuffer, List<ColumnOrSuperColumn>> columnFamiliesMap = new HashMap<ByteBuffer, List<ColumnOrSuperColumn>>();
         for (ReadCommand command: commands)
         {
@@ -320,7 +322,7 @@ public class CassandraServer implements Cassandra.Iface
             ClientState cState = state();
             String keyspace = cState.getKeyspace();
             state().hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);
-            return getSliceInternal(keyspace, key, column_parent, System.currentTimeMillis(), predicate, consistency_level);
+            return getSliceInternal(keyspace, key, column_parent, System.currentTimeMillis(), predicate, consistency_level, cState);
         }
         catch (RequestValidationException e)
         {
@@ -337,10 +339,11 @@ public class CassandraServer implements Cassandra.Iface
                                                        ColumnParent column_parent,
                                                        long timestamp,
                                                        SlicePredicate predicate,
-                                                       ConsistencyLevel consistency_level)
+                                                       ConsistencyLevel consistency_level,
+                                                       ClientState cState)
     throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
     {
-        return multigetSliceInternal(keyspace, Collections.singletonList(key), column_parent, timestamp, predicate, consistency_level).get(key);
+        return multigetSliceInternal(keyspace, Collections.singletonList(key), column_parent, timestamp, predicate, consistency_level, cState).get(key);
     }
 
     public Map<ByteBuffer, List<ColumnOrSuperColumn>> multiget_slice(List<ByteBuffer> keys, ColumnParent column_parent, SlicePredicate predicate, ConsistencyLevel consistency_level)
@@ -367,7 +370,7 @@ public class CassandraServer implements Cassandra.Iface
             ClientState cState = state();
             String keyspace = cState.getKeyspace();
             cState.hasColumnFamilyAccess(keyspace, column_parent.column_family, Permission.SELECT);
-            return multigetSliceInternal(keyspace, keys, column_parent, System.currentTimeMillis(), predicate, consistency_level);
+            return multigetSliceInternal(keyspace, keys, column_parent, System.currentTimeMillis(), predicate, consistency_level, cState);
         }
         catch (RequestValidationException e)
         {
@@ -404,7 +407,7 @@ public class CassandraServer implements Cassandra.Iface
             if (metadata.isSuper())
             {
                 CellNameType columnType = new SimpleDenseCellNameType(metadata.comparator.subtype(parent.isSetSuper_column() ? 1 : 0));
-                SortedSet<CellName> s = new TreeSet<CellName>(columnType);
+                SortedSet<CellName> s = new TreeSet<>(columnType);
                 for (ByteBuffer bb : predicate.column_names)
                     s.add(columnType.cellFromByteBuffer(bb));
                 filter = SuperColumns.fromSCNamesFilter(metadata.comparator, parent.bufferForSuper_column(), new NamesQueryFilter(s));
@@ -429,7 +432,8 @@ public class CassandraServer implements Cassandra.Iface
                                                                              ColumnParent column_parent,
                                                                              long timestamp,
                                                                              SlicePredicate predicate,
-                                                                             ConsistencyLevel consistency_level)
+                                                                             ConsistencyLevel consistency_level,
+                                                                             ClientState cState)
     throws org.apache.cassandra.exceptions.InvalidRequestException, UnavailableException, TimedOutException
     {
         CFMetaData metadata = ThriftValidation.validateColumnFamily(keyspace, column_parent.column_family);
@@ -450,7 +454,7 @@ public class CassandraServer implements Cassandra.Iface
             commands.add(ReadCommand.create(keyspace, key, column_parent.getColumn_family(), timestamp, filter.cloneShallow()));
         }
 
-        return getSlice(commands, column_parent.isSetSuper_column(), consistencyLevel);
+        return getSlice(commands, column_parent.isSetSuper_column(), consistencyLevel, cState);
     }
 
     public ColumnOrSuperColumn get(ByteBuffer key, ColumnPath column_path, ConsistencyLevel consistency_level)
@@ -499,7 +503,7 @@ public class CassandraServer implements Cassandra.Iface
             long now = System.currentTimeMillis();
             ReadCommand command = ReadCommand.create(keyspace, key, column_path.column_family, now, filter);
 
-            Map<DecoratedKey, ColumnFamily> cfamilies = readColumnFamily(Arrays.asList(command), consistencyLevel);
+            Map<DecoratedKey, ColumnFamily> cfamilies = readColumnFamily(Arrays.asList(command), consistencyLevel, cState);
 
             ColumnFamily cf = cfamilies.get(StorageService.getPartitioner().decorateKey(command.key));
 
@@ -547,14 +551,14 @@ public class CassandraServer implements Cassandra.Iface
             long timestamp = System.currentTimeMillis();
 
             if (predicate.column_names != null)
-                return getSliceInternal(keyspace, key, column_parent, timestamp, predicate, consistency_level).size();
+                return getSliceInternal(keyspace, key, column_parent, timestamp, predicate, consistency_level, cState).size();
 
             int pageSize;
             // request by page if this is a large row
             if (cfs.getMeanColumns() > 0)
             {
                 int averageColumnSize = (int) (cfs.getMeanRowSize() / cfs.getMeanColumns());
-                pageSize = Math.min(COUNT_PAGE_SIZE, DatabaseDescriptor.getInMemoryCompactionLimit() / averageColumnSize);
+                pageSize = Math.min(COUNT_PAGE_SIZE, 4 * 1024 * 1024 / averageColumnSize);
                 pageSize = Math.max(2, pageSize);
                 logger.debug("average row column size is {}; using pageSize of {}", averageColumnSize, pageSize);
             }
@@ -573,6 +577,7 @@ public class CassandraServer implements Cassandra.Iface
                                           key,
                                           filter,
                                           ThriftConversion.fromThrift(consistency_level),
+                                          cState,
                                           pageSize,
                                           timestamp);
         }
@@ -635,7 +640,8 @@ public class CassandraServer implements Cassandra.Iface
                                                                                                  column_parent,
                                                                                                  System.currentTimeMillis(),
                                                                                                  predicate,
-                                                                                                 consistency_level);
+                                                                                                 consistency_level,
+                                                                                                 cState);
 
             for (Map.Entry<ByteBuffer, List<ColumnOrSuperColumn>> cf : columnFamiliesMap.entrySet())
                 counts.put(cf.getKey(), cf.getValue().size());
@@ -667,7 +673,7 @@ public class CassandraServer implements Cassandra.Iface
             throw new org.apache.cassandra.exceptions.InvalidRequestException("missing mandatory super column name for super CF " + column_parent.column_family);
         }
         ThriftValidation.validateColumnNames(metadata, column_parent, Arrays.asList(column.name));
-        ThriftValidation.validateColumnData(metadata, column_parent.super_column, column);
+        ThriftValidation.validateColumnData(metadata, key, column_parent.super_column, column);
 
         org.apache.cassandra.db.Mutation mutation;
         try
@@ -760,7 +766,7 @@ public class CassandraServer implements Cassandra.Iface
             });
             ThriftValidation.validateColumnNames(metadata, new ColumnParent(column_family), names);
             for (Column column : updates)
-                ThriftValidation.validateColumnData(metadata, null, column);
+                ThriftValidation.validateColumnData(metadata, key, null, column);
 
             CFMetaData cfm = Schema.instance.getCFMetaData(cState.getKeyspace(), column_family);
             ColumnFamily cfUpdates = ArrayBackedSortedColumns.factory.create(cfm);
@@ -783,10 +789,10 @@ public class CassandraServer implements Cassandra.Iface
             ColumnFamily result = StorageProxy.cas(cState.getKeyspace(),
                                                    column_family,
                                                    key,
-                                                   new ThriftCASConditions(cfExpected),
-                                                   cfUpdates,
+                                                   new ThriftCASRequest(cfExpected, cfUpdates),
                                                    ThriftConversion.fromThrift(serial_consistency_level),
-                                                   ThriftConversion.fromThrift(commit_consistency_level));
+                                                   ThriftConversion.fromThrift(commit_consistency_level),
+                                                   cState);
             return result == null
                  ? new CASResult(true)
                  : new CASResult(false).setCurrent_values(thriftifyColumnsAsColumns(result.getSortedColumns(), System.currentTimeMillis()));
@@ -852,7 +858,7 @@ public class CassandraServer implements Cassandra.Iface
 
                 for (Mutation m : columnFamilyMutations.getValue())
                 {
-                    ThriftValidation.validateMutation(metadata, m);
+                    ThriftValidation.validateMutation(metadata, key, m);
 
                     if (m.deletion != null)
                     {
@@ -924,7 +930,7 @@ public class CassandraServer implements Cassandra.Iface
             if (del.super_column == null && cfm.isSuper())
                 mutation.deleteRange(cfm.cfName,
                                      SuperColumns.startOf(del.predicate.getSlice_range().start),
-                                     SuperColumns.startOf(del.predicate.getSlice_range().finish),
+                                     SuperColumns.endOf(del.predicate.getSlice_range().finish),
                                      del.timestamp);
             else if (del.super_column != null)
                 mutation.deleteRange(cfm.cfName,
@@ -933,8 +939,8 @@ public class CassandraServer implements Cassandra.Iface
                                      del.timestamp);
             else
                 mutation.deleteRange(cfm.cfName,
-                                     cfm.comparator.cellFromByteBuffer(del.predicate.getSlice_range().start),
-                                     cfm.comparator.cellFromByteBuffer(del.predicate.getSlice_range().finish),
+                                     cfm.comparator.fromByteBuffer(del.predicate.getSlice_range().start),
+                                     cfm.comparator.fromByteBuffer(del.predicate.getSlice_range().finish),
                                      del.timestamp);
         }
         else
@@ -1160,11 +1166,11 @@ public class CassandraServer implements Cassandra.Iface
 
             List<Row> rows = null;
 
-            IPartitioner<?> p = StorageService.getPartitioner();
+            IPartitioner p = StorageService.getPartitioner();
             AbstractBounds<RowPosition> bounds;
             if (range.start_key == null)
             {
-                Token.TokenFactory<?> tokenFactory = p.getTokenFactory();
+                Token.TokenFactory tokenFactory = p.getTokenFactory();
                 Token left = tokenFactory.fromString(range.start_token);
                 Token right = tokenFactory.fromString(range.end_token);
                 bounds = Range.makeRowRange(left, right, p);
@@ -1875,7 +1881,7 @@ public class CassandraServer implements Cassandra.Iface
 
                     decompressor.end();
 
-                    queryString = new String(decompressed.getData(), 0, decompressed.getLength(), "UTF-8");
+                    queryString = new String(decompressed.getData(), 0, decompressed.getLength(), StandardCharsets.UTF_8);
                     break;
                 case NONE:
                     try
@@ -1892,10 +1898,6 @@ public class CassandraServer implements Cassandra.Iface
         catch (DataFormatException e)
         {
             throw new InvalidRequestException("Error deflating query string.");
-        }
-        catch (UnsupportedEncodingException e)
-        {
-            throw new InvalidRequestException("Unknown query string encoding.");
         }
         return queryString;
     }
@@ -2071,11 +2073,14 @@ public class CassandraServer implements Cassandra.Iface
                 fixOptionalSliceParameters(request.getColumn_slices().get(i));
                 Composite start = metadata.comparator.fromByteBuffer(request.getColumn_slices().get(i).start);
                 Composite finish = metadata.comparator.fromByteBuffer(request.getColumn_slices().get(i).finish);
-                int compare = metadata.comparator.compare(start, finish);
-                if (!request.reversed && compare > 0)
-                    throw new InvalidRequestException(String.format("Column slice at index %d had start greater than finish", i));
-                else if (request.reversed && compare < 0)
-                    throw new InvalidRequestException(String.format("Reversed column slice at index %d had start less than finish", i));
+                if (!start.isEmpty() && !finish.isEmpty())
+                {
+                    int compare = metadata.comparator.compare(start, finish);
+                    if (!request.reversed && compare > 0)
+                        throw new InvalidRequestException(String.format("Column slice at index %d had start greater than finish", i));
+                    else if (request.reversed && compare < 0)
+                        throw new InvalidRequestException(String.format("Reversed column slice at index %d had start less than finish", i));
+                }
                 slices[i] = new ColumnSlice(start, finish);
             }
 
@@ -2083,7 +2088,7 @@ public class CassandraServer implements Cassandra.Iface
             SliceQueryFilter filter = new SliceQueryFilter(deoverlapped, request.reversed, request.count);
             ThriftValidation.validateKey(metadata, request.key);
             commands.add(ReadCommand.create(keyspace, request.key, request.column_parent.getColumn_family(), System.currentTimeMillis(), filter));
-            return getSlice(commands, request.column_parent.isSetSuper_column(), consistencyLevel).entrySet().iterator().next().getValue();
+            return getSlice(commands, request.column_parent.isSetSuper_column(), consistencyLevel, cState).entrySet().iterator().next().getValue();
         }
         catch (RequestValidationException e)
         {
@@ -2165,16 +2170,16 @@ public class CassandraServer implements Cassandra.Iface
         try
         {
             ThriftClientState cState = state();
-            org.apache.cassandra.cql3.CQLStatement statement = cState.getCQLQueryHandler().getPreparedForThrift(itemId);
+            ParsedStatement.Prepared prepared = cState.getCQLQueryHandler().getPreparedForThrift(itemId);
 
-            if (statement == null)
+            if (prepared == null)
                 throw new InvalidRequestException(String.format("Prepared query with ID %d not found" +
                                                                 " (either the query was not prepared on this host (maybe the host has been restarted?)" +
                                                                 " or you have prepared too many queries and it has been evicted from the internal cache)",
                                                                 itemId));
-            logger.trace("Retrieved prepared statement #{} with {} bind markers", itemId, statement.getBoundTerms());
+            logger.trace("Retrieved prepared statement #{} with {} bind markers", itemId, prepared.statement.getBoundTerms());
 
-            return cState.getCQLQueryHandler().processPrepared(statement,
+            return cState.getCQLQueryHandler().processPrepared(prepared.statement,
                                                                cState.getQueryState(),
                                                                QueryOptions.fromProtocolV2(ThriftConversion.fromThrift(cLevel), bindVariables)).toThriftResult();
         }
@@ -2249,13 +2254,15 @@ public class CassandraServer implements Cassandra.Iface
         });
     }
 
-    private static class ThriftCASConditions implements CASConditions
+    private static class ThriftCASRequest implements CASRequest
     {
         private final ColumnFamily expected;
+        private final ColumnFamily updates;
 
-        private ThriftCASConditions(ColumnFamily expected)
+        private ThriftCASRequest(ColumnFamily expected, ColumnFamily updates)
         {
             this.expected = expected;
+            this.updates = updates;
         }
 
         public IDiskAtomFilter readFilter()
@@ -2300,10 +2307,9 @@ public class CassandraServer implements Cassandra.Iface
             return cf != null && !cf.hasOnlyTombstones(now);
         }
 
-        @Override
-        public String toString()
+        public ColumnFamily makeUpdates(ColumnFamily current)
         {
-            return expected.toString();
+            return updates;
         }
     }
 }

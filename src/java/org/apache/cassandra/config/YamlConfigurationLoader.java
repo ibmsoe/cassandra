@@ -19,6 +19,7 @@ package org.apache.cassandra.config;
 
 import java.beans.IntrospectionException;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.io.IOException;
 import java.net.URL;
@@ -49,7 +50,7 @@ public class YamlConfigurationLoader implements ConfigurationLoader
     /**
      * Inspect the classpath to find storage configuration file
      */
-    private URL getStorageConfigURL() throws ConfigurationException
+    static URL getStorageConfigURL() throws ConfigurationException
     {
         String configUrl = System.getProperty("cassandra.config");
         if (configUrl == null)
@@ -66,7 +67,13 @@ public class YamlConfigurationLoader implements ConfigurationLoader
             ClassLoader loader = DatabaseDescriptor.class.getClassLoader();
             url = loader.getResource(configUrl);
             if (url == null)
-                throw new ConfigurationException("Cannot locate " + configUrl);
+            {
+                String required = "file:" + File.separator + File.separator;
+                if (!configUrl.startsWith(required))
+                    throw new ConfigurationException("Expecting URI in variable: [cassandra.config].  Please prefix the file with " + required + File.separator +
+                            " for local files or " + required + "<server>" + File.separator + " for remote files. Aborting. If you are executing this from an external tool, it needs to set Config.setClientMode(true) to avoid loading configuration.");
+                throw new ConfigurationException("Cannot locate " + configUrl + ".  If this is a local file, please confirm you've provided " + required + File.separator + " as a URI prefix.");
+            }
         }
 
         return url;
@@ -74,9 +81,14 @@ public class YamlConfigurationLoader implements ConfigurationLoader
 
     public Config loadConfig() throws ConfigurationException
     {
+        return loadConfig(getStorageConfigURL());
+    }
+
+    public Config loadConfig(URL url) throws ConfigurationException
+    {
+        InputStream input = null;
         try
         {
-            URL url = getStorageConfigURL();
             logger.info("Loading settings from {}", url);
             byte[] configBytes;
             try (InputStream is = url.openStream())
@@ -88,7 +100,7 @@ public class YamlConfigurationLoader implements ConfigurationLoader
                 // getStorageConfigURL should have ruled this out
                 throw new AssertionError(e);
             }
-            
+
             logConfig(configBytes);
             
             org.yaml.snakeyaml.constructor.Constructor constructor = new org.yaml.snakeyaml.constructor.Constructor(Config.class);
@@ -122,16 +134,16 @@ public class YamlConfigurationLoader implements ConfigurationLoader
         }
         logger.info("Node configuration:[" + Joiner.on("; ").join(configMap.entrySet()) + "]");
     }
-    
-    private static class MissingPropertiesChecker extends PropertyUtils 
+
+    private static class MissingPropertiesChecker extends PropertyUtils
     {
         private final Set<String> missingProperties = new HashSet<>();
-        
+
         public MissingPropertiesChecker()
         {
             setSkipMissingProperties(true);
         }
-        
+
         @Override
         public Property getProperty(Class<? extends Object> type, String name) throws IntrospectionException
         {
@@ -142,10 +154,10 @@ public class YamlConfigurationLoader implements ConfigurationLoader
             }
             return result;
         }
-        
+
         public void check() throws ConfigurationException
         {
-            if (!missingProperties.isEmpty()) 
+            if (!missingProperties.isEmpty())
             {
                 throw new ConfigurationException("Invalid yaml. Please remove properties " + missingProperties + " from your cassandra.yaml");
             }

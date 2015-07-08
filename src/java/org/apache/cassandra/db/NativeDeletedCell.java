@@ -106,13 +106,7 @@ public class NativeDeletedCell extends NativeCell implements DeletedCell
     }
 
     @Override
-    public boolean equals(Cell cell)
-    {
-        return timestamp() == cell.timestamp() && getLocalDeletionTime() == cell.getLocalDeletionTime() && name().equals(cell.name());
-    }
-
-    @Override
-    public long excessHeapSizeExcludingData()
+    public long unsharedHeapSizeExcludingData()
     {
         return SIZE;
     }

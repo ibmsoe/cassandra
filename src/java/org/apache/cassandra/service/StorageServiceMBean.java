@@ -30,8 +30,6 @@ import java.util.concurrent.TimeoutException;
 import javax.management.NotificationEmitter;
 import javax.management.openmbean.TabularData;
 
-import org.apache.cassandra.db.compaction.CompactionManager;
-
 public interface StorageServiceMBean extends NotificationEmitter
 {
     /**
@@ -213,6 +211,18 @@ public interface StorageServiceMBean extends NotificationEmitter
     public void takeColumnFamilySnapshot(String keyspaceName, String columnFamilyName, String tag) throws IOException;
 
     /**
+     * Takes the snapshot of a multiple column family from different keyspaces. A snapshot name must be specified.
+     * 
+     * @param tag
+     *            the tag given to the snapshot; may not be null or empty
+     * @param columnFamilyList
+     *            list of columnfamily from different keyspace in the form of ks1.cf1 ks2.cf2
+     */
+    public void takeMultipleColumnFamilySnapshot(String tag, String... columnFamilyList) throws IOException;
+    
+    
+    
+    /**
      * Remove the snapshot with the given name from the given keyspaces.
      * If no tag is specified we will remove all snapshots.
      */
@@ -238,7 +248,7 @@ public interface StorageServiceMBean extends NotificationEmitter
     /**
      * Trigger a cleanup of keys on a single keyspace
      */
-    public CompactionManager.AllSSTableOpStatus forceKeyspaceCleanup(String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int forceKeyspaceCleanup(String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Scrub (deserialize + reserialize at the latest version, skipping bad rows if any) the given keyspace.
@@ -246,13 +256,15 @@ public interface StorageServiceMBean extends NotificationEmitter
      *
      * Scrubbed CFs will be snapshotted first, if disableSnapshot is false
      */
-    public CompactionManager.AllSSTableOpStatus scrub(boolean disableSnapshot, boolean skipCorrupted, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    @Deprecated
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Rewrite all sstables to the latest version.
      * Unlike scrub, it doesn't skip bad rows and do not snapshot sstables first.
      */
-    public CompactionManager.AllSSTableOpStatus upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+    public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
      * Flush all memtables for the given column families, or all columnfamilies for the given keyspace
@@ -268,11 +280,23 @@ public interface StorageServiceMBean extends NotificationEmitter
      * You can track repair progress by subscribing JMX notification sent from this StorageServiceMBean.
      * Notification format is:
      *   type: "repair"
-     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of AntiEntropyService.Status
+     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
      *
      * @return Repair command number, or 0 if nothing to repair
      */
     public int forceRepairAsync(String keyspace, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts,  boolean primaryRange, boolean repairedAt, String... columnFamilies) throws IOException;
+
+    /**
+     * Invoke repair asynchronously.
+     * You can track repair progress by subscribing JMX notification sent from this StorageServiceMBean.
+     * Notification format is:
+     *   type: "repair"
+     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
+     *
+     * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
+     * @return Repair command number, or 0 if nothing to repair
+     */
+    public int forceRepairAsync(String keyspace, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean primaryRange, boolean fullRepair, String... columnFamilies);
 
     /**
      * Same as forceRepairAsync, but handles a specified range
@@ -280,11 +304,18 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, boolean isSequential, Collection<String> dataCenters, Collection<String> hosts, boolean repairedAt, String... columnFamilies) throws IOException;
 
     /**
+     * Same as forceRepairAsync, but handles a specified range
+     *
+     * @param parallelismDegree 0: sequential, 1: parallel, 2: DC parallel
+     */
+    public int forceRepairRangeAsync(String beginToken, String endToken, String keyspaceName, int parallelismDegree, Collection<String> dataCenters, Collection<String> hosts, boolean fullRepair, String... columnFamilies);
+
+    /**
      * Invoke repair asynchronously.
      * You can track repair progress by subscribing JMX notification sent from this StorageServiceMBean.
      * Notification format is:
      *   type: "repair"
-     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of AntiEntropyService.Status
+     *   userObject: int array of length 2, [0]=command number, [1]=ordinal of ActiveRepairService.Status
      *
      * @return Repair command number, or 0 if nothing to repair
      */
@@ -307,11 +338,6 @@ public interface StorageServiceMBean extends NotificationEmitter
      * This node will unload its data onto its neighbors, and bootstrap to the new token.
      */
     public void move(String newToken) throws IOException;
-
-    /**
-     * @param srcTokens tokens to move to this node
-     */
-    public void relocate(Collection<String> srcTokens) throws IOException;
 
     /**
      * removeToken removes token (and all data associated with
@@ -351,6 +377,9 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     /** get the operational mode (leaving, joining, normal, decommissioned, client) **/
     public String getOperationMode();
+
+    /** Returns whether the storage service is starting or not */
+    public boolean isStarting();
 
     /** get the progress of a drain operation */
     public String getDrainProgress();
@@ -402,6 +431,9 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     // allows a user to recover a forcibly 'killed' node
     public void startGossiping();
+
+    // allows a user to see whether gossip is running or not
+    public boolean isGossipRunning();
 
     // allows a user to forcibly completely stop cassandra
     public void stopDaemon();
@@ -485,7 +517,7 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     /**
      * Enables/Disables tracing for the whole system. Only thrift requests can start tracing currently.
-     * 
+     *
      * @param probability
      *            ]0,1[ will enable tracing on a partial number of requests with the provided probability. 0 will
      *            disable tracing and 1 will enable tracing for all requests (which mich severely cripple the system)
@@ -496,11 +528,6 @@ public interface StorageServiceMBean extends NotificationEmitter
      * Returns the configured tracing probability.
      */
     public double getTracingProbability();
-
-    /** Begin processing of queued range transfers. */
-    public void enableScheduledRangeXfers();
-    /** Disable processing of queued range transfers. */
-    public void disableScheduledRangeXfers();
 
     void disableAutoCompaction(String ks, String ... columnFamilies) throws IOException;
     void enableAutoCompaction(String ks, String ... columnFamilies) throws IOException;
@@ -521,4 +548,7 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int getTombstoneFailureThreshold();
     /** Sets the threshold for abandoning queries with many tombstones */
     public void setTombstoneFailureThreshold(int tombstoneDebugThreshold);
+
+    /** Sets the hinted handoff throttle in kb per second, per delivery thread. */
+    public void setHintedHandoffThrottleInKB(int throttleInKB);
 }

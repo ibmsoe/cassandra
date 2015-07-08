@@ -99,15 +99,12 @@ public abstract class AbstractMarker extends Term.NonTerminal
         private static ColumnSpecification makeInReceiver(ColumnSpecification receiver)
         {
             ColumnIdentifier inName = new ColumnIdentifier("in(" + receiver.name + ")", true);
-            return new ColumnSpecification(receiver.ksName, receiver.cfName, inName, ListType.getInstance(receiver.type));
+            return new ColumnSpecification(receiver.ksName, receiver.cfName, inName, ListType.getInstance(receiver.type, false));
         }
 
         @Override
         public AbstractMarker prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            if (receiver.type instanceof CollectionType)
-                throw new InvalidRequestException("Collection columns do not support IN relations");
-
             return new Lists.Marker(bindIndex, makeInReceiver(receiver));
         }
     }

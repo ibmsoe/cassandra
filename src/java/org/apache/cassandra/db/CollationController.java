@@ -28,6 +28,9 @@ import com.google.common.base.Function;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 
+import net.nicoulaj.compilecommand.annotations.Inline;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.db.columniterator.OnDiskAtomIterator;
 import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
 import org.apache.cassandra.db.composites.CellName;
@@ -74,6 +77,7 @@ public class CollationController
         boolean isEmpty = true;
         Tracing.trace("Acquiring sstable references");
         ColumnFamilyStore.ViewFragment view = cfs.select(cfs.viewFilter(filter.key));
+        DeletionInfo returnDeletionInfo = container.deletionInfo();
 
         try
         {
@@ -106,13 +110,12 @@ public class CollationController
             Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
 
             // read sorted sstables
-            long mostRecentRowTombstone = Long.MIN_VALUE;
             for (SSTableReader sstable : view.sstables)
             {
                 // if we've already seen a row tombstone with a timestamp greater
                 // than the most recent update to this sstable, we're done, since the rest of the sstables
                 // will also be older
-                if (sstable.getMaxTimestamp() < mostRecentRowTombstone)
+                if (sstable.getMaxTimestamp() < returnDeletionInfo.getTopLevelDeletion().markedForDeleteAt)
                     break;
 
                 long currentMaxTs = sstable.getMaxTimestamp();
@@ -121,15 +124,13 @@ public class CollationController
                     break;
 
                 Tracing.trace("Merging data from sstable {}", sstable.descriptor.generation);
+                sstable.incrementReadCount();
                 OnDiskAtomIterator iter = reducedFilter.getSSTableColumnIterator(sstable);
                 iterators.add(iter);
                 isEmpty = false;
                 if (iter.getColumnFamily() != null)
                 {
-                    ColumnFamily cf = iter.getColumnFamily();
-                    if (cf.isMarkedForDelete())
-                        mostRecentRowTombstone = cf.deletionInfo().getTopLevelDeletion().markedForDeleteAt;
-                    container.delete(cf);
+                    container.delete(iter.getColumnFamily());
                     sstablesIterated++;
                     while (iter.hasNext())
                         container.addAtom(iter.next());
@@ -149,12 +150,20 @@ public class CollationController
             // "hoist up" the requested data into a more recent sstable
             if (sstablesIterated > cfs.getMinimumCompactionThreshold()
                 && !cfs.isAutoCompactionDisabled()
-                && cfs.getCompactionStrategy() instanceof SizeTieredCompactionStrategy)
+                && cfs.getCompactionStrategy().shouldDefragment())
             {
+                // !!WARNING!!   if we stop copying our data to a heap-managed object,
+                //               we will need to track the lifetime of this mutation as well
                 Tracing.trace("Defragmenting requested data");
-                Mutation mutation = new Mutation(cfs.keyspace.getName(), filter.key.getKey(), returnCF.cloneMe());
-                // skipping commitlog and index updates is fine since we're just de-fragmenting existing data
-                Keyspace.open(mutation.getKeyspaceName()).apply(mutation, false, false);
+                final Mutation mutation = new Mutation(cfs.keyspace.getName(), filter.key.getKey(), returnCF.cloneMe());
+                StageManager.getStage(Stage.MUTATION).execute(new Runnable()
+                {
+                    public void run()
+                    {
+                        // skipping commitlog and index updates is fine since we're just de-fragmenting existing data
+                        Keyspace.open(mutation.getKeyspaceName()).apply(mutation, false, false);
+                    }
+                });
             }
 
             // Caller is responsible for final removeDeletedCF.  This is important for cacheRow to work correctly:
@@ -233,7 +242,6 @@ public class CollationController
              */
             Collections.sort(view.sstables, SSTableReader.maxTimestampComparator);
             List<SSTableReader> skippedSSTables = null;
-            long mostRecentRowTombstone = Long.MIN_VALUE;
             long minTimestamp = Long.MAX_VALUE;
             int nonIntersectingSSTables = 0;
 
@@ -242,7 +250,7 @@ public class CollationController
                 minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());
                 // if we've already seen a row tombstone with a timestamp greater
                 // than the most recent update to this sstable, we can skip it
-                if (sstable.getMaxTimestamp() < mostRecentRowTombstone)
+                if (sstable.getMaxTimestamp() < returnDeletionInfo.getTopLevelDeletion().markedForDeleteAt)
                     break;
 
                 if (!filter.shouldInclude(sstable))
@@ -264,9 +272,6 @@ public class CollationController
                 if (iter.getColumnFamily() != null)
                 {
                     ColumnFamily cf = iter.getColumnFamily();
-                    if (cf.isMarkedForDelete())
-                        mostRecentRowTombstone = cf.deletionInfo().getTopLevelDeletion().markedForDeleteAt;
-
                     returnCF.delete(cf);
                     sstablesIterated++;
                 }

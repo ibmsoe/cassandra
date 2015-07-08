@@ -24,7 +24,7 @@ import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.transport.Event;
 
 public class DropTypeStatement extends SchemaAlteringStatement
 {
@@ -117,18 +117,18 @@ public class DropTypeStatement extends SchemaAlteringStatement
         else if (toCheck instanceof CollectionType)
         {
             if (toCheck instanceof ListType)
-                return isUsedBy(((ListType)toCheck).elements);
+                return isUsedBy(((ListType)toCheck).getElementsType());
             else if (toCheck instanceof SetType)
-                return isUsedBy(((SetType)toCheck).elements);
+                return isUsedBy(((SetType)toCheck).getElementsType());
             else
-                return isUsedBy(((MapType)toCheck).keys) || isUsedBy(((MapType)toCheck).keys);
+                return isUsedBy(((MapType)toCheck).getKeysType()) || isUsedBy(((MapType)toCheck).getValuesType());
         }
         return false;
     }
 
-    public ResultMessage.SchemaChange.Change changeType()
+    public Event.SchemaChange changeEvent()
     {
-        return ResultMessage.SchemaChange.Change.UPDATED;
+        return new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, Event.SchemaChange.Target.TYPE, keyspace(), name.getStringTypeName());
     }
 
     @Override
@@ -137,14 +137,17 @@ public class DropTypeStatement extends SchemaAlteringStatement
         return name.getKeyspace();
     }
 
-    public void announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
+    public boolean announceMigration(boolean isLocalOnly) throws InvalidRequestException, ConfigurationException
     {
         KSMetaData ksm = Schema.instance.getKSMetaData(name.getKeyspace());
         assert ksm != null;
 
         UserType toDrop = ksm.userTypes.getType(name.getUserTypeName());
         // Can be null with ifExists
-        if (toDrop != null)
-            MigrationManager.announceTypeDrop(toDrop, isLocalOnly);
+        if (toDrop == null)
+            return false;
+
+        MigrationManager.announceTypeDrop(toDrop, isLocalOnly);
+        return true;
     }
 }

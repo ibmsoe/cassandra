@@ -28,6 +28,7 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.github.jamm.Unmetered;
 
 /**
  * Specifies a Comparator for a specific type of ByteBuffer.
@@ -37,6 +38,7 @@ import org.apache.cassandra.serializers.MarshalException;
  * should always handle those values even if they normally do not
  * represent a valid ByteBuffer for the type being compared.
  */
+@Unmetered
 public abstract class AbstractType<T> implements Comparator<ByteBuffer>
 {
     public final Comparator<ByteBuffer> reverseComparator;
@@ -95,6 +97,19 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         getSerializer().validate(bytes);
     }
 
+    /**
+     * Validate cell value. Unlike {@linkplain #validate(java.nio.ByteBuffer)},
+     * cell value is passed to validate its content.
+     * Usually, this is the same as validate except collection.
+     *
+     * @param cellValue ByteBuffer representing cell value
+     * @throws MarshalException
+     */
+    public void validateCellValue(ByteBuffer cellValue) throws MarshalException
+    {
+        validate(cellValue);
+    }
+
     /* Most of our internal type should override that. */
     public CQL3Type asCQL3Type()
     {
@@ -149,15 +164,28 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /**
-     * Returns true if values of the previous AbstracType can be read by the this
-     * AbsractType. Note that this is a weaker version of isCompatibleWith, as it
-     * does not require that both type compare values the same way.
+     * Returns true if values of the other AbstractType can be read and "reasonably" interpreted by the this
+     * AbstractType. Note that this is a weaker version of isCompatibleWith, as it does not require that both type
+     * compare values the same way.
+     *
+     * The restriction on the other type being "reasonably" interpreted is to prevent, for example, IntegerType from
+     * being compatible with all other types.  Even though any byte string is a valid IntegerType value, it doesn't
+     * necessarily make sense to interpret a UUID or a UTF8 string as an integer.
      *
      * Note that a type should be compatible with at least itself.
      */
-    public boolean isValueCompatibleWith(AbstractType<?> previous)
+    public boolean isValueCompatibleWith(AbstractType<?> otherType)
     {
-        return isCompatibleWith(previous);
+        return isValueCompatibleWithInternal((otherType instanceof ReversedType) ? ((ReversedType) otherType).baseType : otherType);
+    }
+
+    /**
+     * Needed to handle ReversedType in value-compatibility checks.  Subclasses should implement this instead of
+     * isValueCompatibleWith().
+     */
+    protected boolean isValueCompatibleWithInternal(AbstractType<?> otherType)
+    {
+        return isCompatibleWith(otherType);
     }
 
     /**
@@ -195,6 +223,24 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public boolean isCollection()
     {
         return false;
+    }
+
+    public boolean isMultiCell()
+    {
+        return false;
+    }
+
+    public AbstractType<?> freeze()
+    {
+        return this;
+    }
+
+    /**
+     * @param ignoreFreezing if true, the type string will not be wrapped with FrozenType(...), even if this type is frozen.
+     */
+    public String toString(boolean ignoreFreezing)
+    {
+        return this.toString();
     }
 
     /**

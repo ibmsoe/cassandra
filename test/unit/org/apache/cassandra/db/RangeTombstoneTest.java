@@ -18,6 +18,7 @@
 */
 package org.apache.cassandra.db;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -25,12 +26,14 @@ import java.util.List;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.IndexType;
@@ -50,6 +53,7 @@ import org.apache.cassandra.db.index.SecondaryIndexSearcher;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
@@ -224,6 +228,178 @@ public class RangeTombstoneTest extends SchemaLoader
     }
 
     @Test
+    public void testTrackTimesRowTombstone() throws ExecutionException, InterruptedException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.truncateBlocking();
+        String key = "rt_times";
+        Mutation rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        long timestamp = System.currentTimeMillis();
+        cf.delete(new DeletionInfo(1000, (int)(timestamp/1000)));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        SSTableReader sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
+        cfs.forceMajorCompaction();
+        sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
+    }
+
+    @Test
+    public void testTrackTimesRowTombstoneWithData() throws ExecutionException, InterruptedException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.truncateBlocking();
+        String key = "rt_times";
+        Mutation rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        add(rm, 5, 999);
+        rm.apply();
+        key = "rt_times2";
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        int timestamp = (int)(System.currentTimeMillis()/1000);
+        cf.delete(new DeletionInfo(1000, timestamp));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        SSTableReader sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
+        cfs.forceMajorCompaction();
+        sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
+    }
+    @Test
+    public void testTrackTimesRangeTombstone() throws ExecutionException, InterruptedException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.truncateBlocking();
+        String key = "rt_times";
+        Mutation rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        long timestamp = System.currentTimeMillis();
+        cf.delete(new DeletionInfo(b(1), b(2), cfs.getComparator(), 1000, (int)(timestamp/1000)));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        SSTableReader sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
+        cfs.forceMajorCompaction();
+        sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 1000, 1000, (int)(timestamp/1000));
+    }
+
+    @Test
+    public void testTrackTimesRangeTombstoneWithData() throws ExecutionException, InterruptedException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.truncateBlocking();
+        String key = "rt_times";
+        Mutation rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        add(rm, 5, 999);
+        rm.apply();
+        key = "rt_times2";
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        int timestamp = (int)(System.currentTimeMillis()/1000);
+        cf.delete(new DeletionInfo(b(1), b(2), cfs.getComparator(), 1000, timestamp));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        SSTableReader sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
+        cfs.forceMajorCompaction();
+        sstable = cfs.getSSTables().iterator().next();
+        assertTimes(sstable.getSSTableMetadata(), 999, 1000, Integer.MAX_VALUE);
+    }
+
+    private void assertTimes(StatsMetadata metadata, long min, long max, int localDeletionTime)
+    {
+        assertEquals(min, metadata.minTimestamp);
+        assertEquals(max, metadata.maxTimestamp);
+        assertEquals(localDeletionTime, metadata.maxLocalDeletionTime);
+    }
+
+    @Test
+    public void test7810() throws ExecutionException, InterruptedException, IOException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.metadata.gcGraceSeconds(2);
+
+        String key = "7810";
+        Mutation rm;
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        for (int i = 10; i < 20; i++)
+            add(rm, i, 0);
+        rm.apply();
+        cfs.forceBlockingFlush();
+
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        cf.delete(new DeletionInfo(b(10),b(11), cfs.getComparator(), 1, 1));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        Thread.sleep(5);
+        cfs.forceMajorCompaction();
+        assertEquals(8, Util.getColumnFamily(ks, Util.dk(key), CFNAME).getColumnCount());
+    }
+
+    @Test
+    public void test7808_1() throws ExecutionException, InterruptedException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.metadata.gcGraceSeconds(2);
+
+        String key = "7808_1";
+        Mutation rm;
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        for (int i = 0; i < 40; i += 2)
+            add(rm, i, 0);
+        rm.apply();
+        cfs.forceBlockingFlush();
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        cf.delete(new DeletionInfo(1, 1));
+        rm.apply();
+        cfs.forceBlockingFlush();
+        Thread.sleep(5);
+        cfs.forceMajorCompaction();
+    }
+
+    @Test
+    public void test7808_2() throws ExecutionException, InterruptedException, IOException
+    {
+        Keyspace ks = Keyspace.open(KSNAME);
+        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CFNAME);
+        cfs.metadata.gcGraceSeconds(2);
+
+        String key = "7808_2";
+        Mutation rm;
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        for (int i = 10; i < 20; i++)
+            add(rm, i, 0);
+        rm.apply();
+        cfs.forceBlockingFlush();
+
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        ColumnFamily cf = rm.addOrGet(CFNAME);
+        cf.delete(new DeletionInfo(0,0));
+        rm.apply();
+
+        rm = new Mutation(KSNAME, ByteBufferUtil.bytes(key));
+        add(rm, 5, 1);
+        rm.apply();
+
+        cfs.forceBlockingFlush();
+        Thread.sleep(5);
+        cfs.forceMajorCompaction();
+        assertEquals(1, Util.getColumnFamily(ks, Util.dk(key), CFNAME).getColumnCount());
+    }
+
+    @Test
     public void overlappingRangeTest() throws Exception
     {
         CompactionManager.instance.disableAutoCompaction();
@@ -312,22 +488,13 @@ public class RangeTombstoneTest extends SchemaLoader
     }
 
     @Test
-    public void testPreCompactedRowWithRangeTombstonesUpdatesSecondaryIndex() throws Exception
+    public void testRowWithRangeTombstonesUpdatesSecondaryIndex() throws Exception
     {
-        // nothing special to do here, just run the test
         runCompactionWithRangeTombstoneAndCheckSecondaryIndex();
     }
 
     @Test
-    public void testLazilyCompactedRowWithRangeTombstonesUpdatesSecondaryIndex() throws Exception
-    {
-        // make sure we use LazilyCompactedRow by exceeding in_memory_compaction_limit
-        DatabaseDescriptor.setInMemoryCompactionLimit(0);
-        runCompactionWithRangeTombstoneAndCheckSecondaryIndex();
-    }
-
-    @Test
-    public void testLazilyCompactedRowGeneratesSameSSTablesAsPreCompactedRow() throws Exception
+    public void testRangeTombstoneCompaction() throws Exception
     {
         Keyspace table = Keyspace.open(KSNAME);
         ColumnFamilyStore cfs = table.getColumnFamilyStore(CFNAME);
@@ -511,6 +678,9 @@ public class RangeTombstoneTest extends SchemaLoader
         {
             deletes.add(col);
         }
+
+        @Override
+        public void deleteForCleanup(ByteBuffer rowKey, Cell col, OpOrder.Group opGroup) {}
 
         public void insert(ByteBuffer rowKey, Cell col, OpOrder.Group opGroup)
         {

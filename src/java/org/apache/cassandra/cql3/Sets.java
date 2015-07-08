@@ -18,15 +18,7 @@
 package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 
 import com.google.common.base.Joiner;
 
@@ -34,11 +26,13 @@ import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.composites.CellName;
 import org.apache.cassandra.db.composites.Composite;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.Server;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -51,7 +45,7 @@ public abstract class Sets
 
     public static ColumnSpecification valueSpecOf(ColumnSpecification column)
     {
-        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((SetType)column.type).elements);
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier("value(" + column.name + ")", true), ((SetType)column.type).getElementsType());
     }
 
     public static class Literal implements Term.Raw
@@ -72,7 +66,6 @@ public abstract class Sets
             if (receiver.type instanceof MapType && elements.isEmpty())
                 return new Maps.Value(Collections.<ByteBuffer, ByteBuffer>emptyMap());
 
-
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
             Set<Term> values = new HashSet<Term>(elements.size());
             boolean allTerminal = true;
@@ -81,14 +74,14 @@ public abstract class Sets
                 Term t = rt.prepare(keyspace, valueSpec);
 
                 if (t.containsBindMarker())
-                    throw new InvalidRequestException(String.format("Invalid set literal for %s: bind variables are not supported inside collection literals", receiver));
+                    throw new InvalidRequestException(String.format("Invalid set literal for %s: bind variables are not supported inside collection literals", receiver.name));
 
                 if (t instanceof Term.NonTerminal)
                     allTerminal = false;
 
                 values.add(t);
             }
-            DelayedValue value = new DelayedValue(((SetType)receiver.type).elements, values);
+            DelayedValue value = new DelayedValue(((SetType)receiver.type).getElementsType(), values);
             return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;
         }
 
@@ -98,17 +91,17 @@ public abstract class Sets
             {
                 // We've parsed empty maps as a set literal to break the ambiguity so
                 // handle that case now
-                if (receiver.type instanceof MapType && elements.isEmpty())
+                if ((receiver.type instanceof MapType) && elements.isEmpty())
                     return;
 
-                throw new InvalidRequestException(String.format("Invalid set literal for %s of type %s", receiver, receiver.type.asCQL3Type()));
+                throw new InvalidRequestException(String.format("Invalid set literal for %s of type %s", receiver.name, receiver.type.asCQL3Type()));
             }
 
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
             for (Term.Raw rt : elements)
             {
                 if (!rt.isAssignableTo(keyspace, valueSpec))
-                    throw new InvalidRequestException(String.format("Invalid set literal for %s: value %s is not of type %s", receiver, rt, valueSpec.type.asCQL3Type()));
+                    throw new InvalidRequestException(String.format("Invalid set literal for %s: value %s is not of type %s", receiver.name, rt, valueSpec.type.asCQL3Type()));
             }
         }
 
@@ -132,11 +125,11 @@ public abstract class Sets
         }
     }
 
-    public static class Value extends Term.Terminal
+    public static class Value extends Term.Terminal implements Term.CollectionTerminal
     {
-        public final Set<ByteBuffer> elements;
+        public final SortedSet<ByteBuffer> elements;
 
-        public Value(Set<ByteBuffer> elements)
+        public Value(SortedSet<ByteBuffer> elements)
         {
             this.elements = elements;
         }
@@ -148,9 +141,9 @@ public abstract class Sets
                 // Collections have this small hack that validate cannot be called on a serialized object,
                 // but compose does the validation (so we're fine).
                 Set<?> s = (Set<?>)type.getSerializer().deserializeForNativeProtocol(value, version);
-                Set<ByteBuffer> elements = new LinkedHashSet<ByteBuffer>(s.size());
+                SortedSet<ByteBuffer> elements = new TreeSet<ByteBuffer>(type.getElementsType());
                 for (Object element : s)
-                    elements.add(type.elements.decompose(element));
+                    elements.add(type.getElementsType().decompose(element));
                 return new Value(elements);
             }
             catch (MarshalException e)
@@ -161,7 +154,12 @@ public abstract class Sets
 
         public ByteBuffer get(QueryOptions options)
         {
-            return CollectionSerializer.pack(new ArrayList<ByteBuffer>(elements), elements.size(), options.getProtocolVersion());
+            return getWithProtocolVersion(options.getProtocolVersion());
+        }
+
+        public ByteBuffer getWithProtocolVersion(int protocolVersion)
+        {
+            return CollectionSerializer.pack(new ArrayList<>(elements), elements.size(), protocolVersion);
         }
 
         public boolean equals(SetType st, Value v)
@@ -171,8 +169,9 @@ public abstract class Sets
 
             Iterator<ByteBuffer> thisIter = elements.iterator();
             Iterator<ByteBuffer> thatIter = v.elements.iterator();
+            AbstractType elementsType = st.getElementsType();
             while (thisIter.hasNext())
-                if (st.elements.compare(thisIter.next(), thatIter.next()) != 0)
+                if (elementsType.compare(thisIter.next(), thatIter.next()) != 0)
                     return false;
 
             return true;
@@ -203,7 +202,7 @@ public abstract class Sets
 
         public Value bind(QueryOptions options) throws InvalidRequestException
         {
-            Set<ByteBuffer> buffers = new TreeSet<ByteBuffer>(comparator);
+            SortedSet<ByteBuffer> buffers = new TreeSet<>(comparator);
             for (Term t : elements)
             {
                 ByteBuffer bytes = t.bindAndGet(options);
@@ -247,9 +246,12 @@ public abstract class Sets
 
         public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
         {
-            // delete + add
-            CellName name = cf.getComparator().create(prefix, column);
-            cf.addAtom(params.makeTombstoneForOverwrite(name.slice()));
+            if (column.type.isMultiCell())
+            {
+                // delete + add
+                CellName name = cf.getComparator().create(prefix, column);
+                cf.addAtom(params.makeTombstoneForOverwrite(name.slice()));
+            }
             Adder.doAdd(t, cf, prefix, column, params);
         }
     }
@@ -263,26 +265,40 @@ public abstract class Sets
 
         public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
         {
+            assert column.type.isMultiCell() : "Attempted to add items to a frozen set";
+
             doAdd(t, cf, prefix, column, params);
         }
 
         static void doAdd(Term t, ColumnFamily cf, Composite prefix, ColumnDefinition column, UpdateParameters params) throws InvalidRequestException
         {
             Term.Terminal value = t.bind(params.options);
-            if (value == null)
-                return;
-
-            assert value instanceof Sets.Value : value;
-
-            Set<ByteBuffer> toAdd = ((Sets.Value)value).elements;
-            for (ByteBuffer bb : toAdd)
+            Sets.Value setValue = (Sets.Value)value;
+            if (column.type.isMultiCell())
             {
-                CellName cellName = cf.getComparator().create(prefix, column, bb);
-                cf.addColumn(params.makeColumn(cellName, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+                if (value == null)
+                    return;
+
+                Set<ByteBuffer> toAdd = setValue.elements;
+                for (ByteBuffer bb : toAdd)
+                {
+                    CellName cellName = cf.getComparator().create(prefix, column, bb);
+                    cf.addColumn(params.makeColumn(cellName, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+                }
+            }
+            else
+            {
+                // for frozen sets, we're overwriting the whole cell
+                CellName cellName = cf.getComparator().create(prefix, column);
+                if (value == null)
+                    cf.addAtom(params.makeTombstone(cellName));
+                else
+                    cf.addColumn(params.makeColumn(cellName, ((Value) value).getWithProtocolVersion(Server.CURRENT_VERSION)));
             }
         }
     }
 
+    // Note that this is reused for Map subtraction too (we subtract a set from a map)
     public static class Discarder extends Operation
     {
         public Discarder(ColumnDefinition column, Term t)
@@ -292,19 +308,40 @@ public abstract class Sets
 
         public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
         {
+            assert column.type.isMultiCell() : "Attempted to remove items from a frozen set";
+
             Term.Terminal value = t.bind(params.options);
             if (value == null)
                 return;
 
             // This can be either a set or a single element
-            Set<ByteBuffer> toDiscard = value instanceof Constants.Value
-                                      ? Collections.singleton(((Constants.Value)value).bytes)
-                                      : ((Sets.Value)value).elements;
+            Set<ByteBuffer> toDiscard = value instanceof Sets.Value
+                                      ? ((Sets.Value)value).elements
+                                      : Collections.singleton(value.get(params.options));
 
             for (ByteBuffer bb : toDiscard)
             {
                 cf.addColumn(params.makeTombstone(cf.getComparator().create(prefix, column, bb)));
             }
+        }
+    }
+
+    public static class ElementDiscarder extends Operation
+    {
+        public ElementDiscarder(ColumnDefinition column, Term k)
+        {
+            super(column, k);
+        }
+
+        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : "Attempted to delete a single element in a frozen set";
+            Term.Terminal elt = t.bind(params.options);
+            if (elt == null)
+                throw new InvalidRequestException("Invalid null set element");
+
+            CellName cellName = cf.getComparator().create(prefix, column, elt.get(params.options));
+            cf.addColumn(params.makeTombstone(cellName));
         }
     }
 }

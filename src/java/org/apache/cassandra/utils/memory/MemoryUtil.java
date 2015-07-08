@@ -22,6 +22,7 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
+import com.google.common.primitives.*;
 import sun.misc.Unsafe;
 
 public abstract class MemoryUtil
@@ -242,7 +243,7 @@ public abstract class MemoryUtil
         if (buffer.isDirect())
             setBytes(unsafe.getLong(buffer, DIRECT_BYTE_BUFFER_ADDRESS_OFFSET) + start, address, count);
         else
-            setBytes(address, buffer.array(), start, count);
+            setBytes(address, buffer.array(), buffer.arrayOffset() + start, count);
     }
 
     /**

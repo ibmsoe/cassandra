@@ -22,13 +22,16 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.EnumMap;
+import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.util.Version;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +64,7 @@ public class Server implements CassandraDaemon.Server
     }
 
     private static final Logger logger = LoggerFactory.getLogger(Server.class);
+    private static final boolean enableEpoll = Boolean.valueOf(System.getProperty("cassandra.native.epoll.enabled", "true"));
 
     public static final int VERSION_3 = 3;
     public static final int CURRENT_VERSION = VERSION_3;
@@ -138,12 +142,26 @@ public class Server implements CassandraDaemon.Server
 
         // Configure the server.
         eventExecutorGroup = new RequestThreadPoolExecutor();
-        workerGroup = new NioEventLoopGroup();
+
+
+        boolean hasEpoll = enableEpoll ? Epoll.isAvailable() : false;
+        if (hasEpoll)
+        {
+            workerGroup = new EpollEventLoopGroup();
+            logger.info("Netty using native Epoll event loop");
+        }
+        else
+        {
+            workerGroup = new NioEventLoopGroup();
+            logger.info("Netty using Java NIO event loop");
+        }
 
         ServerBootstrap bootstrap = new ServerBootstrap()
                                     .group(workerGroup)
-                                    .channel(NioServerSocketChannel.class)
+                                    .channel(hasEpoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
                                     .childOption(ChannelOption.TCP_NODELAY, true)
+                                    .childOption(ChannelOption.SO_LINGER, 0)
+                                    .childOption(ChannelOption.SO_KEEPALIVE, DatabaseDescriptor.getRpcKeepAlive())
                                     .childOption(ChannelOption.ALLOCATOR, CBUtil.allocator)
                                     .childOption(ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK, 32 * 1024)
                                     .childOption(ChannelOption.WRITE_BUFFER_LOW_WATER_MARK, 8 * 1024);
@@ -162,8 +180,12 @@ public class Server implements CassandraDaemon.Server
         // Bind and start to accept incoming connections.
         logger.info("Using Netty Version: {}", Version.identify().entrySet());
         logger.info("Starting listening for CQL clients on {}...", socket);
-        Channel channel = bootstrap.bind(socket).channel();
-        connectionTracker.allChannels.add(channel);
+
+        ChannelFuture bindFuture = bootstrap.bind(socket);
+        if (!bindFuture.awaitUninterruptibly().isSuccess())
+            throw new IllegalStateException(String.format("Failed to bind port %d on %s.", socket.getPort(), socket.getAddress().getHostAddress()));
+
+        connectionTracker.allChannels.add(bindFuture.channel());
         isRunning.set(true);
     }
 
@@ -250,6 +272,7 @@ public class Server implements CassandraDaemon.Server
         private static final Frame.Compressor frameCompressor = new Frame.Compressor();
         private static final Frame.Encoder frameEncoder = new Frame.Encoder();
         private static final Message.Dispatcher dispatcher = new Message.Dispatcher();
+        private static final ConnectionLimitHandler connectionLimitHandler = new ConnectionLimitHandler();
 
         private final Server server;
 
@@ -261,6 +284,14 @@ public class Server implements CassandraDaemon.Server
         protected void initChannel(Channel channel) throws Exception
         {
             ChannelPipeline pipeline = channel.pipeline();
+
+            // Add the ConnectionLimitHandler to the pipeline if configured to do so.
+            if (DatabaseDescriptor.getNativeTransportMaxConcurrentConnections() > 0
+                    || DatabaseDescriptor.getNativeTransportMaxConcurrentConnectionsPerIp() > 0)
+            {
+                // Add as first to the pipeline so the limit is enforced as first action.
+                pipeline.addFirst("connectionLimitHandler", connectionLimitHandler);
+            }
 
             //pipeline.addLast("debug", new LoggingHandler());
 
@@ -302,16 +333,17 @@ public class Server implements CassandraDaemon.Server
             sslEngine.setUseClientMode(false);
             sslEngine.setEnabledCipherSuites(encryptionOptions.cipher_suites);
             sslEngine.setNeedClientAuth(encryptionOptions.require_client_auth);
-
+            sslEngine.setEnabledProtocols(SSLFactory.ACCEPTED_PROTOCOLS);
             SslHandler sslHandler = new SslHandler(sslEngine);
             super.initChannel(channel);
             channel.pipeline().addFirst("ssl", sslHandler);
         }
     }
 
-    private static class EventNotifier implements IEndpointLifecycleSubscriber, IMigrationListener
+    private static class EventNotifier extends MigrationListener implements IEndpointLifecycleSubscriber
     {
         private final Server server;
+        private final Map<InetAddress, Event.StatusChange.Status> lastStatusChange = new ConcurrentHashMap<>();
         private static final InetAddress bindAll;
         static {
             try
@@ -366,12 +398,16 @@ public class Server implements CassandraDaemon.Server
 
         public void onUp(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.StatusChange.nodeUp(getRpcAddress(endpoint), server.socket.getPort()));
+            Event.StatusChange.Status prev = lastStatusChange.put(endpoint, Event.StatusChange.Status.UP);
+            if (prev == null || prev != Event.StatusChange.Status.UP)
+                server.connectionTracker.send(Event.StatusChange.nodeUp(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
         public void onDown(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.StatusChange.nodeDown(getRpcAddress(endpoint), server.socket.getPort()));
+            Event.StatusChange.Status prev = lastStatusChange.put(endpoint, Event.StatusChange.Status.DOWN);
+            if (prev == null || prev != Event.StatusChange.Status.DOWN)
+                server.connectionTracker.send(Event.StatusChange.nodeDown(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
         public void onCreateKeyspace(String ksName)
@@ -394,7 +430,7 @@ public class Server implements CassandraDaemon.Server
             server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, ksName));
         }
 
-        public void onUpdateColumnFamily(String ksName, String cfName)
+        public void onUpdateColumnFamily(String ksName, String cfName, boolean columnsDidChange)
         {
             server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.TABLE, ksName, cfName));
         }

@@ -22,6 +22,7 @@ package org.apache.cassandra.db;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
 
@@ -34,9 +35,19 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.commitlog.CommitLogDescriptor;
+import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.commitlog.CommitLogSegment;
 import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.CellNameType;
+import org.apache.cassandra.db.filter.NamesQueryFilter;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.KillerForTests;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
@@ -248,7 +259,7 @@ public class CommitLogTest extends SchemaLoader
             CommitLog.instance.recover(new File[]{ logFile }); //CASSANDRA-1119 / CASSANDRA-1179 throw on failure*/
         }
     }
-    
+
     @Test
     public void testVersions()
     {
@@ -263,5 +274,101 @@ public class CommitLogTest extends SchemaLoader
         Assert.assertEquals(MessagingService.current_version, new CommitLogDescriptor(1340512736956320000L).getMessagingVersion());
         String newCLName = "CommitLog-" + CommitLogDescriptor.current_version + "-1340512736956320000.log";
         Assert.assertEquals(MessagingService.current_version, CommitLogDescriptor.fromFileName(newCLName).getMessagingVersion());
+    }
+
+    @Test
+    public void testCommitFailurePolicy_stop() throws ConfigurationException
+    {
+        // Need storage service active so stop policy can shutdown gossip
+        StorageService.instance.initServer();
+        Assert.assertTrue(Gossiper.instance.isEnabled());
+
+        Config.CommitFailurePolicy oldPolicy = DatabaseDescriptor.getCommitFailurePolicy();
+        try
+        {
+            DatabaseDescriptor.setCommitFailurePolicy(Config.CommitFailurePolicy.stop);
+            CommitLog.handleCommitError("Test stop error", new Throwable());
+            Assert.assertFalse(Gossiper.instance.isEnabled());
+        }
+        finally
+        {
+            DatabaseDescriptor.setCommitFailurePolicy(oldPolicy);
+        }
+    }
+
+    @Test
+    public void testCommitFailurePolicy_die()
+    {
+        KillerForTests killerForTests = new KillerForTests();
+        JVMStabilityInspector.Killer originalKiller = JVMStabilityInspector.replaceKiller(killerForTests);
+        Config.CommitFailurePolicy oldPolicy = DatabaseDescriptor.getCommitFailurePolicy();
+        try
+        {
+            DatabaseDescriptor.setCommitFailurePolicy(Config.CommitFailurePolicy.die);
+            CommitLog.handleCommitError("Testing die policy", new Throwable());
+            Assert.assertTrue(killerForTests.wasKilled());
+        }
+        finally
+        {
+            DatabaseDescriptor.setCommitFailurePolicy(oldPolicy);
+            JVMStabilityInspector.replaceKiller(originalKiller);
+        }
+    }
+
+    @Test
+    public void testTruncateWithoutSnapshot()  throws ExecutionException, InterruptedException
+    {
+        CommitLog.instance.resetUnsafe();
+        boolean prev = DatabaseDescriptor.isAutoSnapshot();
+        DatabaseDescriptor.setAutoSnapshot(false);
+        ColumnFamilyStore cfs1 = Keyspace.open("Keyspace1").getColumnFamilyStore("Standard1");
+        ColumnFamilyStore cfs2 = Keyspace.open("Keyspace1").getColumnFamilyStore("Standard2");
+
+        final Mutation rm1 = new Mutation("Keyspace1", bytes("k"));
+        rm1.add("Standard1", Util.cellname("c1"), ByteBuffer.allocate(100), 0);
+        rm1.apply();
+        cfs1.truncateBlocking();
+        DatabaseDescriptor.setAutoSnapshot(prev);
+        final Mutation rm2 = new Mutation("Keyspace1", bytes("k"));
+        rm2.add("Standard2", Util.cellname("c1"), ByteBuffer.allocate(DatabaseDescriptor.getCommitLogSegmentSize() / 4), 0);
+
+        for (int i = 0 ; i < 5 ; i++)
+            CommitLog.instance.add(rm2);
+
+        Assert.assertEquals(2, CommitLog.instance.activeSegments());
+        ReplayPosition position = CommitLog.instance.getContext();
+        for (Keyspace ks : Keyspace.system())
+            for (ColumnFamilyStore syscfs : ks.getColumnFamilyStores())
+                CommitLog.instance.discardCompletedSegments(syscfs.metadata.cfId, position);
+        CommitLog.instance.discardCompletedSegments(cfs2.metadata.cfId, position);
+        Assert.assertEquals(1, CommitLog.instance.activeSegments());
+    }
+
+    @Test
+    public void testTruncateWithoutSnapshotNonDurable()  throws ExecutionException, InterruptedException
+    {
+        CommitLog.instance.resetUnsafe();
+        boolean prevAutoSnapshot = DatabaseDescriptor.isAutoSnapshot();
+        DatabaseDescriptor.setAutoSnapshot(false);
+        Keyspace notDurableKs = Keyspace.open("NoCommitlogSpace");
+        Assert.assertFalse(notDurableKs.getMetadata().durableWrites);
+        ColumnFamilyStore cfs = notDurableKs.getColumnFamilyStore("Standard1");
+        CellNameType type = notDurableKs.getColumnFamilyStore("Standard1").getComparator();
+        Mutation rm;
+        DecoratedKey dk = Util.dk("key1");
+
+        // add data
+        rm = new Mutation("NoCommitlogSpace", dk.getKey());
+        rm.add("Standard1", Util.cellname("Column1"), ByteBufferUtil.bytes("abcd"), 0);
+        rm.apply();
+
+        ReadCommand command = new SliceByNamesReadCommand("NoCommitlogSpace", dk.getKey(), "Standard1", System.currentTimeMillis(), new NamesQueryFilter(FBUtilities.singleton(Util.cellname("Column1"), type)));
+        Row row = command.getRow(notDurableKs);
+        Cell col = row.cf.getColumn(Util.cellname("Column1"));
+        Assert.assertEquals(col.value(), ByteBuffer.wrap("abcd".getBytes()));
+        cfs.truncateBlocking();
+        DatabaseDescriptor.setAutoSnapshot(prevAutoSnapshot);
+        row = command.getRow(notDurableKs);
+        Assert.assertEquals(null, row.cf);
     }
 }

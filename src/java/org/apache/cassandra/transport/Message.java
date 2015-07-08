@@ -18,9 +18,11 @@
 package org.apache.cassandra.transport;
 
 import java.util.ArrayList;
+import java.io.IOException;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -32,11 +34,15 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.MessageToMessageEncoder;
+
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.transport.messages.*;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * A message from the CQL binary protocol.
@@ -44,6 +50,17 @@ import org.apache.cassandra.service.QueryState;
 public abstract class Message
 {
     protected static final Logger logger = LoggerFactory.getLogger(Message.class);
+
+    /**
+     * When we encounter an unexpected IOException we look for these {@link Throwable#getMessage() messages}
+     * (because we have no better way to distinguish) and log them at DEBUG rather than INFO, since they
+     * are generally caused by unclean client disconnects rather than an actual problem.
+     */
+    private static final Set<String> ioExceptionsAtDebugLevel = ImmutableSet.<String>builder().
+            add("Connection reset by peer").
+            add("Broken pipe").
+            add("Connection timed out").
+            build();
 
     public interface Codec<M extends Message> extends CBCodec<M> {}
 
@@ -110,6 +127,8 @@ public abstract class Message
 
         public static Type fromOpcode(int opcode, Direction direction)
         {
+            if (opcode >= opcodeIdx.length)
+                throw new ProtocolException(String.format("Unknown opcode %d", opcode));
             Type t = opcodeIdx[opcode];
             if (t == null)
                 throw new ProtocolException(String.format("Unknown opcode %d", opcode));
@@ -126,7 +145,7 @@ public abstract class Message
     public final Type type;
     protected Connection connection;
     private int streamId;
-    private Frame sourceFrame = null;
+    private Frame sourceFrame;
 
     protected Message(Type type)
     {
@@ -268,41 +287,48 @@ public abstract class Message
             EnumSet<Frame.Header.Flag> flags = EnumSet.noneOf(Frame.Header.Flag.class);
 
             Codec<Message> codec = (Codec<Message>)message.type.codec;
-            int messageSize = codec.encodedSize(message, version);
-            ByteBuf body;
-            if (message instanceof Response)
+            try
             {
-                UUID tracingId = ((Response)message).getTracingId();
-                if (tracingId != null)
+                int messageSize = codec.encodedSize(message, version);
+                ByteBuf body;
+                if (message instanceof Response)
                 {
-                    body = CBUtil.allocator.buffer(CBUtil.sizeOfUUID(tracingId) + messageSize);
-                    CBUtil.writeUUID(tracingId, body);
-                    flags.add(Frame.Header.Flag.TRACING);
+                    UUID tracingId = ((Response)message).getTracingId();
+                    if (tracingId != null)
+                    {
+                        body = CBUtil.allocator.buffer(CBUtil.sizeOfUUID(tracingId) + messageSize);
+                        CBUtil.writeUUID(tracingId, body);
+                        flags.add(Frame.Header.Flag.TRACING);
+                    }
+                    else
+                    {
+                        body = CBUtil.allocator.buffer(messageSize);
+                    }
                 }
                 else
                 {
+                    assert message instanceof Request;
                     body = CBUtil.allocator.buffer(messageSize);
+                    if (((Request)message).isTracingRequested())
+                        flags.add(Frame.Header.Flag.TRACING);
                 }
-            }
-            else
-            {
-                assert message instanceof Request;
-                body = CBUtil.allocator.buffer(messageSize);
-                if (((Request)message).isTracingRequested())
-                    flags.add(Frame.Header.Flag.TRACING);
-            }
 
-            try
-            {
-                codec.encode(message, body, version);
+                try
+                {
+                    codec.encode(message, body, version);
+                }
+                catch (Throwable e)
+                {
+                    body.release();
+                    throw e;
+                }
+
+                results.add(Frame.create(message.type, message.getStreamId(), version, flags, body));
             }
             catch (Throwable e)
             {
-                body.release();
                 throw ErrorMessage.wrap(e, message.getStreamId());
             }
-
-            results.add(Frame.create(message.type, message.getStreamId(), version, flags, body));
         }
     }
 
@@ -312,10 +338,12 @@ public abstract class Message
         private static class FlushItem
         {
             final ChannelHandlerContext ctx;
-            final Response response;
-            private FlushItem(ChannelHandlerContext ctx, Response response)
+            final Object response;
+            final Frame sourceFrame;
+            private FlushItem(ChannelHandlerContext ctx, Object response, Frame sourceFrame)
             {
                 this.ctx = ctx;
+                this.sourceFrame = sourceFrame;
                 this.response = response;
             }
         }
@@ -360,7 +388,7 @@ public abstract class Message
                     for (ChannelHandlerContext channel : channels)
                         channel.flush();
                     for (FlushItem item : flushed)
-                        item.response.getSourceFrame().release();
+                        item.sourceFrame.release();
 
                     channels.clear();
                     flushed.clear();
@@ -405,27 +433,29 @@ public abstract class Message
                 assert request.connection() instanceof ServerConnection;
                 connection = (ServerConnection)request.connection();
                 QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion(), request.getStreamId());
-                qstate.setSourceFrame(request.getSourceFrame());
 
                 logger.debug("Received: {}, v={}", request, connection.getVersion());
 
                 response = request.execute(qstate);
                 response.setStreamId(request.getStreamId());
                 response.attach(connection);
-                response.setSourceFrame(request.getSourceFrame());
                 connection.applyStateTransition(request.type, response.type);
             }
-            catch (Throwable ex)
+            catch (Throwable t)
             {
-                request.getSourceFrame().release();
-                // Don't let the exception propagate to exceptionCaught() if we can help it so that we can assign the right streamID.
-                ctx.writeAndFlush(ErrorMessage.fromException(ex).setStreamId(request.getStreamId()), ctx.voidPromise());
+                JVMStabilityInspector.inspectThrowable(t);
+                UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), true);
+                flush(new FlushItem(ctx, ErrorMessage.fromException(t, handler).setStreamId(request.getStreamId()), request.getSourceFrame()));
                 return;
             }
 
             logger.debug("Responding: {}, v={}", response, connection.getVersion());
+            flush(new FlushItem(ctx, response, request.getSourceFrame()));
+        }
 
-            EventLoop loop = ctx.channel().eventLoop();
+        private void flush(FlushItem item)
+        {
+            EventLoop loop = item.ctx.channel().eventLoop();
             Flusher flusher = flusherLookup.get(loop);
             if (flusher == null)
             {
@@ -434,7 +464,7 @@ public abstract class Message
                     flusher = alt;
             }
 
-            flusher.queued.add(new FlushItem(ctx, response));
+            flusher.queued.add(item);
             flusher.start();
         }
 
@@ -444,7 +474,8 @@ public abstract class Message
         {
             if (ctx.channel().isOpen())
             {
-                ChannelFuture future = ctx.writeAndFlush(ErrorMessage.fromException(cause));
+                UnexpectedChannelExceptionHandler handler = new UnexpectedChannelExceptionHandler(ctx.channel(), false);
+                ChannelFuture future = ctx.writeAndFlush(ErrorMessage.fromException(cause, handler));
                 // On protocol exception, close the channel as soon as the message have been sent
                 if (cause instanceof ProtocolException)
                 {
@@ -455,6 +486,60 @@ public abstract class Message
                     });
                 }
             }
+        }
+    }
+
+    /**
+     * Include the channel info in the logged information for unexpected errors, and (if {@link #alwaysLogAtError} is
+     * false then choose the log level based on the type of exception (some are clearly client issues and shouldn't be
+     * logged at server ERROR level)
+     */
+    static final class UnexpectedChannelExceptionHandler implements Predicate<Throwable>
+    {
+        private final Channel channel;
+        private final boolean alwaysLogAtError;
+
+        UnexpectedChannelExceptionHandler(Channel channel, boolean alwaysLogAtError)
+        {
+            this.channel = channel;
+            this.alwaysLogAtError = alwaysLogAtError;
+        }
+
+        @Override
+        public boolean apply(Throwable exception)
+        {
+            String message;
+            try
+            {
+                message = "Unexpected exception during request; channel = " + channel;
+            }
+            catch (Exception ignore)
+            {
+                // We don't want to make things worse if String.valueOf() throws an exception
+                message = "Unexpected exception during request; channel = <unprintable>";
+            }
+
+            if (!alwaysLogAtError && exception instanceof IOException)
+            {
+                if (ioExceptionsAtDebugLevel.contains(exception.getMessage()))
+                {
+                    // Likely unclean client disconnects
+                    logger.debug(message, exception);
+                }
+                else
+                {
+                    // Generally unhandled IO exceptions are network issues, not actual ERRORS
+                    logger.info(message, exception);
+                }
+            }
+            else
+            {
+                // Anything else is probably a bug in server of client binary protocol handling
+                logger.error(message, exception);
+            }
+
+            // We handled the exception.
+            return true;
         }
     }
 }

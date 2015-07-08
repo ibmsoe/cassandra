@@ -27,6 +27,7 @@ import org.junit.Test;
 import org.apache.cassandra.db.composites.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.io.sstable.ColumnNameHelper;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.*;
@@ -267,6 +268,33 @@ public class ColumnSliceTest
         slice = new ColumnSlice(composite(1, 1, 2), composite(1, 1, 3));
         assertFalse(slice.intersects(columnNames(1, 1, 0), columnNames(2, 2, 1), nameType, false));
 
+        // empty min/max column names
+        slice = new ColumnSlice(composite(), composite());
+        assertTrue(slice.intersects(columnNames(), columnNames(), nameType, false));
+
+        slice = new ColumnSlice(composite(1), composite());
+        assertTrue(slice.intersects(columnNames(), columnNames(), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(), nameType, false));
+
+        slice = new ColumnSlice(composite(1), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite());
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(2), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite(2));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(2), composite(3));
+        assertFalse(slice.intersects(columnNames(), columnNames(1), nameType, false));
 
         // basic check on reversed slices
         slice = new ColumnSlice(composite(1, 0, 0), composite(0, 0, 0));
@@ -277,6 +305,58 @@ public class ColumnSliceTest
 
         slice = new ColumnSlice(composite(1, 1, 1), composite(1, 1, 0));
         assertTrue(slice.intersects(columnNames(1, 0, 0), columnNames(2, 2, 2), nameType, true));
+    }
+
+    @Test
+    public void testDifferentMinMaxLengths()
+    {
+        List<AbstractType<?>> types = new ArrayList<>();
+        types.add(Int32Type.instance);
+        types.add(Int32Type.instance);
+        types.add(Int32Type.instance);
+        CompoundDenseCellNameType nameType = new CompoundDenseCellNameType(types);
+
+        // slice does intersect
+        ColumnSlice slice = new ColumnSlice(composite(), composite());
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite());
+        assertTrue(slice.intersects(columnNames(1), columnNames(1, 2), nameType, false));
+
+        slice = new ColumnSlice(composite(), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(1), composite());
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(1), composite(1));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(0), composite(1, 2, 3));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(1, 2, 3), composite(2));
+        assertTrue(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        // slice does not intersect
+        slice = new ColumnSlice(composite(2), composite(3, 4, 5));
+        assertFalse(slice.intersects(columnNames(), columnNames(1), nameType, false));
+
+        slice = new ColumnSlice(composite(0), composite(0, 1, 2));
+        assertFalse(slice.intersects(columnNames(1), columnNames(1, 2), nameType, false));
+    }
+    @Test
+    public void testColumnNameHelper()
+    {
+        List<AbstractType<?>> types = new ArrayList<>();
+        types.add(Int32Type.instance);
+        types.add(Int32Type.instance);
+        types.add(Int32Type.instance);
+        CompoundDenseCellNameType nameType = new CompoundDenseCellNameType(types);
+        assertTrue(ColumnNameHelper.overlaps(columnNames(0, 0, 0), columnNames(3, 3, 3), columnNames(1, 1, 1), columnNames(2, 2, 2), nameType));
+        assertFalse(ColumnNameHelper.overlaps(columnNames(0, 0, 0), columnNames(3, 3, 3), columnNames(4, 4, 4), columnNames(5, 5, 5), nameType));
+        assertFalse(ColumnNameHelper.overlaps(columnNames(0, 0, 0), columnNames(3, 3, 3), columnNames(3, 3, 4), columnNames(5, 5, 5), nameType));
+        assertTrue(ColumnNameHelper.overlaps(columnNames(0), columnNames(3, 3, 3), columnNames(1, 1), columnNames(5), nameType));
     }
 
     @Test
@@ -382,12 +462,12 @@ public class ColumnSliceTest
 
     private static void assertSlicesValid(ColumnSlice[] slices)
     {
-        assertTrue("Slices " + toString(slices) + " should be valid", ColumnSlice.validateSlices(slices, simpleIntType));
+        assertTrue("Slices " + toString(slices) + " should be valid", ColumnSlice.validateSlices(slices, simpleIntType, false));
     }
 
     private static void assertSlicesInvalid(ColumnSlice[] slices)
     {
-        assertFalse("Slices " + toString(slices) + " shouldn't be valid", ColumnSlice.validateSlices(slices, simpleIntType));
+        assertFalse("Slices " + toString(slices) + " shouldn't be valid", ColumnSlice.validateSlices(slices, simpleIntType, false));
     }
 
     private static void assertSlicesEquals(ColumnSlice[] expected, ColumnSlice[] actual)

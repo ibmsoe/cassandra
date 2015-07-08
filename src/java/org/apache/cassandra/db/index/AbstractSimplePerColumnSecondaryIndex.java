@@ -71,6 +71,12 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
         return new BufferDecoratedKey(new LocalToken(getIndexKeyComparator(), value), value);
     }
 
+    @Override
+    String indexTypeForGrouping()
+    {
+        return "_internal_";
+    }
+
     protected abstract CellName makeIndexColumnName(ByteBuffer rowKey, Cell cell);
 
     protected abstract ByteBuffer getIndexedValue(ByteBuffer rowKey, Cell cell);
@@ -87,6 +93,11 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
     }
 
     public void delete(ByteBuffer rowKey, Cell cell, OpOrder.Group opGroup)
+    {
+        deleteForCleanup(rowKey, cell, opGroup);
+    }
+
+    public void deleteForCleanup(ByteBuffer rowKey, Cell cell, OpOrder.Group opGroup)
     {
         if (!cell.isLive())
             return;
@@ -121,11 +132,12 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
     }
 
     public void update(ByteBuffer rowKey, Cell oldCol, Cell col, OpOrder.Group opGroup)
-    {        
+    {
         // insert the new value before removing the old one, so we never have a period
         // where the row is invisible to both queries (the opposite seems preferable); see CASSANDRA-5540                    
         insert(rowKey, col, opGroup);
-        delete(rowKey, oldCol, opGroup);
+        if (SecondaryIndexManager.shouldCleanupOldValue(oldCol, col))
+            delete(rowKey, oldCol, opGroup);
     }
 
     public void removeIndex(ByteBuffer columnName)
@@ -173,5 +185,11 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
     public long estimateResultRows()
     {
         return getIndexCfs().getMeanColumns();
-    } 
+    }
+
+    public boolean validate(ByteBuffer rowKey, Cell cell)
+    {
+        return getIndexedValue(rowKey, cell).remaining() < FBUtilities.MAX_UNSIGNED_SHORT
+            && makeIndexColumnName(rowKey, cell).toByteBuffer().remaining() < FBUtilities.MAX_UNSIGNED_SHORT;
+    }
 }

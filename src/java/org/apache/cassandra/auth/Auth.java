@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.auth;
 
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.ImmutableMap;
@@ -25,13 +26,14 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.statements.CFStatement;
 import org.apache.cassandra.cql3.statements.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.SelectStatement;
@@ -42,7 +44,6 @@ import org.apache.cassandra.locator.SimpleStrategy;
 import org.apache.cassandra.service.*;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
 public class Auth
 {
@@ -55,6 +56,9 @@ public class Auth
     public static final String AUTH_KS = "system_auth";
     public static final String USERS_CF = "users";
 
+    // User-level permissions cache.
+    private static final PermissionsCache permissionsCache = new PermissionsCache(DatabaseDescriptor.getAuthorizer());
+
     private static final String USERS_CF_SCHEMA = String.format("CREATE TABLE %s.%s ("
                                                                 + "name text,"
                                                                 + "super boolean,"
@@ -65,6 +69,11 @@ public class Auth
                                                                 90 * 24 * 60 * 60); // 3 months.
 
     private static SelectStatement selectUserStatement;
+
+    public static Set<Permission> getPermissions(AuthenticatedUser user, IResource resource)
+    {
+        return permissionsCache.getPermissions(user, resource);
+    }
 
     /**
      * Checks if the username is stored in AUTH_KS.USERS_CF.
@@ -136,23 +145,18 @@ public class Auth
         DatabaseDescriptor.getAuthorizer().setup();
 
         // register a custom MigrationListener for permissions cleanup after dropped keyspaces/cfs.
-        MigrationManager.instance.register(new MigrationListener());
+        MigrationManager.instance.register(new AuthMigrationListener());
 
         // the delay is here to give the node some time to see its peers - to reduce
         // "Skipped default superuser setup: some nodes were not ready" log spam.
         // It's the only reason for the delay.
-        if (DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddress()) || !DatabaseDescriptor.isAutoBootstrap())
+        ScheduledExecutors.nonPeriodicTasks.schedule(new Runnable()
         {
-            StorageService.tasks.schedule(new Runnable()
-                                          {
-                                              public void run()
-                                              {
-                                                  setupDefaultSuperuser();
-                                              }
-                                          },
-                                          SUPERUSER_SETUP_DELAY,
-                                          TimeUnit.MILLISECONDS);
-        }
+            public void run()
+            {
+                setupDefaultSuperuser();
+            }
+        }, SUPERUSER_SETUP_DELAY, TimeUnit.MILLISECONDS);
 
         try
         {
@@ -228,7 +232,7 @@ public class Auth
                                                      USERS_CF,
                                                      DEFAULT_SUPERUSER_NAME,
                                                      true),
-                                       ConsistencyLevel.QUORUM);
+                                       ConsistencyLevel.ONE);
                 logger.info("Created default superuser '{}'", DEFAULT_SUPERUSER_NAME);
             }
         }
@@ -243,7 +247,8 @@ public class Auth
         // Try looking up the 'cassandra' default super user first, to avoid the range query if possible.
         String defaultSUQuery = String.format("SELECT * FROM %s.%s WHERE name = '%s'", AUTH_KS, USERS_CF, DEFAULT_SUPERUSER_NAME);
         String allUsersQuery = String.format("SELECT * FROM %s.%s LIMIT 1", AUTH_KS, USERS_CF);
-        return !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.QUORUM).isEmpty()
+        return !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.ONE).isEmpty()
+            || !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.QUORUM).isEmpty()
             || !QueryProcessor.process(allUsersQuery, ConsistencyLevel.QUORUM).isEmpty();
     }
 
@@ -273,9 +278,9 @@ public class Auth
     }
 
     /**
-     * IMigrationListener implementation that cleans up permissions on dropped resources.
+     * MigrationListener implementation that cleans up permissions on dropped resources.
      */
-    public static class MigrationListener implements IMigrationListener
+    public static class AuthMigrationListener extends MigrationListener
     {
         public void onDropKeyspace(String ksName)
         {
@@ -285,34 +290,6 @@ public class Auth
         public void onDropColumnFamily(String ksName, String cfName)
         {
             DatabaseDescriptor.getAuthorizer().revokeAll(DataResource.columnFamily(ksName, cfName));
-        }
-
-        public void onDropUserType(String ksName, String userType)
-        {
-        }
-
-        public void onCreateKeyspace(String ksName)
-        {
-        }
-
-        public void onCreateColumnFamily(String ksName, String cfName)
-        {
-        }
-
-        public void onCreateUserType(String ksName, String userType)
-        {
-        }
-
-        public void onUpdateKeyspace(String ksName)
-        {
-        }
-
-        public void onUpdateColumnFamily(String ksName, String cfName)
-        {
-        }
-
-        public void onUpdateUserType(String ksName, String userType)
-        {
         }
     }
 }

@@ -32,12 +32,14 @@ import java.util.Map;
 import com.google.common.base.Splitter;
 
 import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.*;
 import org.apache.cassandra.utils.Hex;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
 
 import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
@@ -80,6 +82,7 @@ public class Client extends SimpleClient
             }
             catch (Exception e)
             {
+                JVMStabilityInspector.inspectThrowable(e);
                 System.err.println("ERROR: " + e.getMessage());
             }
         }
@@ -231,6 +234,8 @@ public class Client extends SimpleClient
 
     public static void main(String[] args) throws Exception
     {
+        Config.setClientMode(true);
+
         // Print usage if no argument is specified.
         if (args.length != 2)
         {

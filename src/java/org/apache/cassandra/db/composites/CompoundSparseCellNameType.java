@@ -24,10 +24,7 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.CQL3Row;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.CollectionType;
-import org.apache.cassandra.db.marshal.ColumnToCollectionType;
-import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
@@ -41,7 +38,6 @@ public class CompoundSparseCellNameType extends AbstractCompoundCellNameType
     protected final Map<ByteBuffer, ColumnIdentifier> internedIds;
 
     private final Composite staticPrefix;
-    private final boolean isByteOrderComparable;
 
     public CompoundSparseCellNameType(List<AbstractType<?>> types)
     {
@@ -64,7 +60,6 @@ public class CompoundSparseCellNameType extends AbstractCompoundCellNameType
         this.columnNameType = columnNameType;
         this.internedIds = internedIds;
         this.staticPrefix = makeStaticPrefix(clusteringType.size());
-        this.isByteOrderComparable = isByteOrderComparable(fullType.types);
     }
 
     private static Composite makeStaticPrefix(int size)
@@ -267,6 +262,17 @@ public class CompoundSparseCellNameType extends AbstractCompoundCellNameType
         @Override
         public int compare(Composite c1, Composite c2)
         {
+            if (c1.isStatic() != c2.isStatic())
+            {
+                // Static sorts before non-static no matter what, except for empty which
+                // always sort first
+                if (c1.isEmpty())
+                    return c2.isEmpty() ? 0 : -1;
+                if (c2.isEmpty())
+                    return 1;
+                return c1.isStatic() ? -1 : 1;
+            }
+
             int s1 = c1.size();
             int s2 = c2.size();
             int minSize = Math.min(s1, s2);

@@ -26,10 +26,13 @@ import java.util.Map;
 
 public enum CliOption
 {
-    KEY("Key details such as size in bytes and value distribution", SettingsKey.helpPrinter()),
+    POP("Population distribution and intra-partition visit order", SettingsPopulation.helpPrinter()),
+    INSERT("Insert specific options relating to various methods for batching and splitting partition updates", SettingsInsert.helpPrinter()),
     COL("Column details such as size and count distribution, data generator, names, comparator and if super columns should be used", SettingsColumn.helpPrinter()),
     RATE("Thread count, rate limit or automatic mode (default is auto)", SettingsRate.helpPrinter()),
     MODE("Thrift or CQL with options", SettingsMode.helpPrinter()),
+    ERRORS("How to handle errors when encountered during stress", SettingsErrors.helpPrinter()),
+    SAMPLE("Specify the number of samples to collect for measuring latency", SettingsSamples.helpPrinter()),
     SCHEMA("Replication settings, compression, compaction, etc.", SettingsSchema.helpPrinter()),
     NODE("Nodes to connect to", SettingsNode.helpPrinter()),
     LOG("Where to log progress to, and the interval at which to do it", SettingsLog.helpPrinter()),

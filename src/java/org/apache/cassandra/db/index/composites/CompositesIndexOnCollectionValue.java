@@ -23,6 +23,7 @@ import java.util.List;
 
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.composites.CBuilder;
 import org.apache.cassandra.db.composites.CellName;
@@ -73,7 +74,14 @@ public class CompositesIndexOnCollectionValue extends CompositesIndex
         builder.add(rowKey);
         for (int i = 0; i < Math.min(columnDef.position(), cellName.size()); i++)
             builder.add(cellName.get(i));
-        builder.add(cellName.get(columnDef.position() + 1));
+
+        // When indexing, cellName is a full name including the collection
+        // key. When searching, restricted clustering columns are included
+        // but the collection key is not. In this case, don't try to add an
+        // element to the builder for it, as it will just end up null and
+        // error out when retrieving cells from the index cf (CASSANDRA-7525)
+        if (cellName.size() >= columnDef.position() + 1)
+            builder.add(cellName.get(columnDef.position() + 1));
         return builder.build();
     }
 
@@ -85,6 +93,12 @@ public class CompositesIndexOnCollectionValue extends CompositesIndex
         for (int i = 0; i < prefixSize; i++)
             builder.add(name.get(i + 1));
         return new IndexedEntry(indexedValue, name, indexEntry.timestamp(), name.get(0), builder.build(), name.get(prefixSize + 1));
+    }
+
+    @Override
+    public boolean supportsOperator(Operator operator)
+    {
+        return operator == Operator.CONTAINS && !(columnDef.type instanceof SetType);
     }
 
     @Override
