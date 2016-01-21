@@ -198,7 +198,7 @@ fi
 startswith() { [ "${1#$2}" != "$1" ]; }
 
 # Per-thread stack size.
-JVM_OPTS="$JVM_OPTS -Xss256k"
+JVM_OPTS="$JVM_OPTS -Xss2048k"
 
 # Larger interned string table, for gossip's benefit (CASSANDRA-6410)
 JVM_OPTS="$JVM_OPTS -XX:StringTableSize=1000003"
@@ -214,9 +214,9 @@ JVM_OPTS="$JVM_OPTS -XX:+UseCMSInitiatingOccupancyOnly"
 JVM_OPTS="$JVM_OPTS -XX:+UseTLAB"
 
 # note: bash evals '1.7.x' as > '1.7' so this is really a >= 1.7 jvm check
-if [ "$JVM_ARCH" = "64-Bit" ] ; then
-    JVM_OPTS="$JVM_OPTS -XX:+UseCondCardMark"
-fi
+#if [ "$JVM_ARCH" = "64-Bit" ] ; then
+#    JVM_OPTS="$JVM_OPTS -XX:+UseCondCardMark"
+#fi
 
 # GC logging options -- uncomment to enable
 # JVM_OPTS="$JVM_OPTS -XX:+PrintGCDetails"
